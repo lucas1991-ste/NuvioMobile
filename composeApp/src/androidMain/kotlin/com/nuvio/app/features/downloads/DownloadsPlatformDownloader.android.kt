@@ -620,6 +620,23 @@ internal actual object DownloadsPlatformDownloader {
             null
         }
 
+        // === Custom-header detection (per-stream) ===
+        // Some CDNs (notably StreamingCommunity's edge) prepend a fixed-size
+        // non-TS header to every segment of a stream. The header survives
+        // AES-128 decryption (it's prepended by the CDN, not the packager),
+        // so we cannot detect it from the encrypted bytes — only from the
+        // decrypted plaintext.
+        //
+        // Strategy: sniff the first segment's decrypted bytes; if we find a
+        // valid TS sync at offset N > 0, treat N as the "prefix length" and
+        // strip the first N bytes from EVERY segment in this playlist. This
+        // produces a clean concatenated .ts that MediaExtractor can parse.
+        //
+        // The detection runs once on the first segment and the prefix length
+        // is cached for the rest of the playlist (CDN headers are constant
+        // within a stream).
+        var tsPrefixBytes: Int? = null
+
         outFile.outputStream().use { output ->
             segmentUrls.forEachIndexed { index, segmentUrl ->
                 job.ensureActive()
@@ -658,14 +675,6 @@ internal actual object DownloadsPlatformDownloader {
                                 preview.replace('\n', ' ').replace('\r', ' ').take(200),
                         )
                     }
-                    // For the very first segment, also log a warning if format
-                    // is unknown — it may still be a valid encrypted blob (AES-128
-                    // ciphertext is indistinguishable from random bytes), so we
-                    // don't hard-fail here; the remux step will catch real issues.
-                    if (index == 0 && sniff == "unknown" && aesKey == null) {
-                        // Soft signal: append a marker to the file name? No —
-                        // we surface the issue at remux time with a clear error.
-                    }
 
                     val plaintext = if (aesKey != null && encryption != null) {
                         val iv = encryption.iv ?: HlsPlaylistParser.deriveIvFromSequence(
@@ -675,7 +684,31 @@ internal actual object DownloadsPlatformDownloader {
                     } else {
                         ciphertext
                     }
-                    output.write(plaintext)
+
+                    // === Custom-prefix strip ===
+                    // Determine prefix length once from the first segment, then
+                    // apply to all subsequent segments in this playlist.
+                    val bytesToWrite = if (tsPrefixBytes == null) {
+                        // First segment (or first we can detect on): scan for TS sync.
+                        val offset = HlsPlaylistParser.findTsSyncOffset(plaintext, maxScan = 1024)
+                        if (offset > 0) {
+                            tsPrefixBytes = offset
+                        }
+                        if (offset >= 0) {
+                            plaintext.copyOfRange(offset, plaintext.size)
+                        } else {
+                            // No TS sync found in first 1KB. Could be fMP4 (handled
+                            // separately via init segment), or genuinely unknown.
+                            // Write as-is; remux pre-flight will produce a clear error.
+                            plaintext
+                        }
+                    } else {
+                        // Subsequent segments: strip the same prefix length detected
+                        // on the first segment. Guard against short segments.
+                        val skip = tsPrefixBytes!!
+                        if (plaintext.size > skip) plaintext.copyOfRange(skip, plaintext.size) else plaintext
+                    }
+                    output.write(bytesToWrite)
                 }
             }
             output.flush()

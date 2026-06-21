@@ -501,6 +501,15 @@ internal actual object DownloadsPlatformDownloader {
         } else {
             null
         }
+
+        // === Custom-header detection (per-stream) ===
+        // Some CDNs (notably StreamingCommunity's edge) prepend a fixed-size
+        // non-TS header to every segment of a stream. ffmpeg on Desktop is
+        // usually able to re-sync itself by scanning the first MB, but stripping
+        // the prefix explicitly is faster (no resync needed) and more robust
+        // across ffmpeg builds.
+        var tsPrefixBytes: Int? = null
+
         outFile.outputStream().use { output ->
             segmentUrls.forEachIndexed { index, segmentUrl ->
                 if (Thread.currentThread().isInterrupted) error("Download cancelled")
@@ -559,7 +568,25 @@ internal actual object DownloadsPlatformDownloader {
                     } else {
                         ciphertext
                     }
-                    output.write(plaintext)
+
+                    // === Custom-prefix strip ===
+                    // Same logic as the Android side: detect once from the first
+                    // segment, then apply to all subsequent segments.
+                    val bytesToWrite = if (tsPrefixBytes == null) {
+                        val offset = HlsPlaylistParser.findTsSyncOffset(plaintext, maxScan = 1024)
+                        if (offset > 0) {
+                            tsPrefixBytes = offset
+                        }
+                        if (offset >= 0) {
+                            plaintext.copyOfRange(offset, plaintext.size)
+                        } else {
+                            plaintext
+                        }
+                    } else {
+                        val skip = tsPrefixBytes!!
+                        if (plaintext.size > skip) plaintext.copyOfRange(skip, plaintext.size) else plaintext
+                    }
+                    output.write(bytesToWrite)
                 } finally {
                     conn.disconnect()
                 }

@@ -344,6 +344,46 @@ object HlsPlaylistParser {
     }
 
     /**
+     * Find the byte offset of the first valid MPEG-TS sync byte (0x47) in
+     * [headerBytes] such that another 0x47 appears exactly 188 bytes later
+     * (and possibly 376, 564, ...). This is what distinguishes a real MPEG-TS
+     * sync byte from a coincidental 0x47 byte inside non-TS data.
+     *
+     * Returns:
+     *   - 0    if the data starts with a valid TS sync (no header prefix)
+     *   - N>0  if there is an N-byte non-TS prefix before the first TS packet
+     *   - -1   if no valid TS sync position is found in the scanned window
+     *
+     * The scan window is [maxScan] bytes from the start of [headerBytes].
+     *
+     * Context: some CDNs (notably the one used by StreamingCommunity via the
+     * Nuvio plugin) prepend a custom 188-byte header to every HLS segment.
+     * The header contains a per-file hash, the producer identifier ("FFmpeg"),
+     * the DVB service name ("Service01"), and 0xFF padding. MediaExtractor
+     * (Android) and some ffmpeg builds cannot sync if the first TS packet is
+     * not at offset 0, so we must strip this prefix from every segment before
+     * concatenating them into the .ts file.
+     */
+    fun findTsSyncOffset(headerBytes: ByteArray, maxScan: Int = 1024): Int {
+        if (headerBytes.size < 189) return -1
+        val scanLimit = minOf(maxScan, headerBytes.size - 188)
+        for (i in 0 until scanLimit) {
+            if (headerBytes[i] != 0x47.toByte()) continue
+            // Confirm by checking the next sync position (188 bytes later).
+            if (headerBytes[i + 188] == 0x47.toByte()) {
+                // Even stronger: check the third sync position if available.
+                if (i + 376 < headerBytes.size) {
+                    if (headerBytes[i + 376] == 0x47.toByte()) return i
+                    // Two syncs is enough evidence; only fail on three if data is long enough.
+                } else {
+                    return i
+                }
+            }
+        }
+        return -1
+    }
+
+    /**
      * Convenience overload: sniff a segment format from the first [bytesToRead]
      * bytes of an [inputStream]. Closes nothing; the caller owns the stream.
      *
