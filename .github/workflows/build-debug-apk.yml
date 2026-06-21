@@ -29,12 +29,12 @@ jobs:
         run: touch local.properties
 
       - name: Build Debug APK
-        run: ./gradlew :composeApp:assembleDebug --no-daemon
+        run: ./gradlew :composeApp:assembleFullDebug --no-daemon
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: nuvio-debug-apk
-          path: composeApp/build/outputs/apk/debug/*.apk
+          path: composeApp/build/outputs/apk/full/debug/*.apk
           retention-days: 30
           if-no-files-found: error
