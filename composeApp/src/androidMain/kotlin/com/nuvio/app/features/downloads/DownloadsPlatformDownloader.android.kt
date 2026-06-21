@@ -1,6 +1,7 @@
 package com.nuvio.app.features.downloads
 
 import android.content.Context
+import android.media.MediaCodec
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.net.Uri
@@ -1081,6 +1082,16 @@ internal actual object DownloadsPlatformDownloader {
             // (MediaExtractor advances through samples of all selected tracks
             // in presentation order). We route each sample to its destination
             // track based on which track the extractor is currently at.
+            //
+            // === CSD samples ===
+            // MediaExtractor may emit CSD (codec-specific data: SPS/PPS for
+            // H.264, VPS+SPS+PPS for HEVC, AudioSpecificConfig for AAC, ...) as
+            // separate samples flagged with BUFFER_FLAG_CODEC_CONFIG. We MUST
+            // skip those samples here, because the CSD bytes have already been
+            // written into the avcC/hvcC/esds box by Mp4Muxer using the
+            // initializationData we set on the Format (see toMedia3Format()).
+            // Writing them again as samples would either duplicate the CSD or
+            // confuse the muxer into thinking they are real media frames.
             while (true) {
                 buffer.clear()
                 val size = vExtractor.readSampleData(buffer, 0)
@@ -1089,28 +1100,35 @@ internal actual object DownloadsPlatformDownloader {
                 // Mp4Muxer reads from buffer.position() to buffer.limit().
                 buffer.limit(size)
                 val flags = vExtractor.sampleFlags
-                var pts = vExtractor.sampleTime
+                val pts = vExtractor.sampleTime
                 val currentTrack = vExtractor.sampleTrackIndex
+                // Skip codec-config samples — CSD is already in the Format.
+                if (flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
+                    vExtractor.advance()
+                    continue
+                }
                 when (currentTrack) {
                     videoTrackIndex -> {
-                        if (pts < lastVideoPts) pts = lastVideoPts
-                        lastVideoPts = pts
+                        var clampedPts = pts
+                        if (clampedPts < lastVideoPts) clampedPts = lastVideoPts
+                        lastVideoPts = clampedPts
                         muxer.writeSampleData(
                             videoOutTrackId,
                             buffer,
-                            BufferInfo(pts, size, flags),
+                            BufferInfo(clampedPts, size, flags),
                         )
                         videoSampleCount++
                     }
                     else -> {
                         val embeddedPos = embeddedAudioTrackIndices.indexOf(currentTrack)
                         if (embeddedPos >= 0) {
-                            if (pts < lastEmbeddedPts[embeddedPos]) pts = lastEmbeddedPts[embeddedPos]
-                            lastEmbeddedPts[embeddedPos] = pts
+                            var clampedPts = pts
+                            if (clampedPts < lastEmbeddedPts[embeddedPos]) clampedPts = lastEmbeddedPts[embeddedPos]
+                            lastEmbeddedPts[embeddedPos] = clampedPts
                             muxer.writeSampleData(
                                 embeddedAudioTrackIds[embeddedPos],
                                 buffer,
-                                BufferInfo(pts, size, flags),
+                                BufferInfo(clampedPts, size, flags),
                             )
                             embeddedAudioSampleCounts[embeddedPos]++
                         }
@@ -1129,13 +1147,19 @@ internal actual object DownloadsPlatformDownloader {
                     if (size < 0) break
                     buffer.limit(size)
                     val flags = ext.sampleFlags
-                    var pts = ext.sampleTime
-                    if (pts < lastExternalPts[idx]) pts = lastExternalPts[idx]
-                    lastExternalPts[idx] = pts
+                    val pts = ext.sampleTime
+                    // Skip codec-config samples (same rationale as above).
+                    if (flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
+                        ext.advance()
+                        continue
+                    }
+                    var clampedPts = pts
+                    if (clampedPts < lastExternalPts[idx]) clampedPts = lastExternalPts[idx]
+                    lastExternalPts[idx] = clampedPts
                     muxer.writeSampleData(
                         trackId,
                         buffer,
-                        BufferInfo(pts, size, flags),
+                        BufferInfo(clampedPts, size, flags),
                     )
                     externalAudioSampleCounts[idx]++
                     ext.advance()
@@ -1209,19 +1233,31 @@ internal actual object DownloadsPlatformDownloader {
      * Convert an `android.media.MediaFormat` (returned by `MediaExtractor`) into
      * an `androidx.media3.common.Format` (consumed by `Mp4Muxer.addTrack`).
      *
-     * We only copy the fields that matter for muxing: mime type, language, and
-     * codec-specific dimensions (width/height/frame-rate for video,
-     * channel-count/sample-rate for audio). All other MediaFormat keys
-     * (CSD-0, CSD-1, max-input-size, KEY_DURATION, ...) are either handled
-     * internally by `MediaExtractor.readSampleData` (which prepends CSD bytes
-     * as samples with the BUFFER_FLAG_CODEC_CONFIG flag) or are not needed by
-     * `Mp4Muxer` — in particular, media3's `Format.Builder` does NOT expose
-     * `setDurationUs()`; the duration is computed automatically by the muxer
-     * from the last written sample's PTS.
+     * We copy the fields that matter for muxing: mime type, language, codec-specific
+     * dimensions (width/height/frame-rate for video, channel-count/sample-rate
+     * for audio), and crucially the **codec-specific data (CSD)** that MediaExtractor
+     * exposes via the "csd-0" / "csd-1" keys.
      *
-     * If the input MediaFormat has a bogus duration (negative or > 24h), it
-     * has already been clamped to 0 by [sanitizeMediaFormatDuration] before
-     * this function is called.
+     * Without CSD in the Format, Mp4Muxer cannot write the `avcC` box (H.264),
+     * `hvcC` box (HEVC), `dvcC` box (Dolby Vision), or `OpusConfiguration` box
+     * that the MP4 container requires. The muxer would throw:
+     *
+     *     "csd-0 and/or csd-1 not found in the format for avcC box"
+     *
+     * CSD layout per codec (as returned by MediaExtractor on TS inputs):
+     *   - H.264 (video/avc):       csd-0 = SPS, csd-1 = PPS (Annex B form: 00 00 00 01 ...)
+     *   - HEVC (video/hevc):       csd-0 = VPS+SPS+PPS concatenated, csd-1 absent
+     *   - AAC (audio/mp4a-latm):   csd-0 = AudioSpecificConfig (2-5 bytes), csd-1 absent
+     *   - Opus (audio/opus):       csd-0 = Opus identification header
+     *
+     * Media3's Mp4Muxer uses an internal `AnnexBToAvccConverter` to convert
+     * Annex B SPS/PPS into the AVCC format required by the avcC box, so we can
+     * pass the raw Annex B bytes directly.
+     *
+     * Note: media3's `Format.Builder` does NOT expose `setDurationUs()`; the
+     * duration is computed automatically by the muxer from the last written
+     * sample's PTS. Any bogus `KEY_DURATION` has already been clamped by
+     * [sanitizeMediaFormatDuration] before this function is called.
      */
     @OptIn(UnstableApi::class)
     private fun toMedia3Format(mediaFormat: MediaFormat): Format {
@@ -1254,6 +1290,28 @@ internal actual object DownloadsPlatformDownloader {
                     builder.setSampleRate(mediaFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE))
                 }
             }
+        }
+
+        // === Codec-Specific Data (CSD) ===
+        // MediaExtractor exposes CSD via the "csd-0" and "csd-1" keys as
+        // ByteBuffer. Media3's Format takes them as a List<ByteArray> via
+        // setInitializationData(). The order matters: csd-0 first, then csd-1.
+        //
+        // The ByteBuffer returned by MediaFormat may have a non-zero position
+        // and a limit smaller than its capacity, so we copy exactly
+        // [position, limit) into a fresh ByteArray.
+        val csdBytes = mutableListOf<ByteArray>()
+        for (csdKey in listOf("csd-0", "csd-1")) {
+            if (!mediaFormat.containsKey(csdKey)) continue
+            val bb = mediaFormat.getByteBuffer(csdKey) ?: continue
+            val bytes = ByteArray(bb.remaining())
+            bb.duplicate().get(bytes) // duplicate() so we don't move the original's position
+            if (bytes.isNotEmpty()) {
+                csdBytes.add(bytes)
+            }
+        }
+        if (csdBytes.isNotEmpty()) {
+            builder.setInitializationData(csdBytes)
         }
 
         return builder.build()
