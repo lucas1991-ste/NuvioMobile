@@ -4,9 +4,11 @@ import android.content.Context
 import android.media.MediaCodec
 import android.media.MediaExtractor
 import android.media.MediaFormat
-import android.media.MediaMuxer
 import android.net.Uri
 import androidx.documentfile.provider.DocumentFile
+import androidx.media3.common.Format
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.muxer.Mp4Muxer
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -627,15 +629,15 @@ internal actual object DownloadsPlatformDownloader {
         // so we cannot detect it from the encrypted bytes — only from the
         // decrypted plaintext.
         //
-        // Strategy: sniff the first segment's decrypted bytes; if we find a
-        // valid TS sync at offset N > 0, treat N as the "prefix length" and
-        // strip the first N bytes from EVERY segment in this playlist. This
-        // produces a clean concatenated .ts that MediaExtractor can parse.
+        // Strategy: for EACH segment, look for a valid TS sync byte (0x47)
+        // followed by another 0x47 exactly 188 bytes later. The prefix length
+        // may vary per segment (different CDN nodes, different padding) so we
+        // re-detect on every segment rather than caching from the first.
         //
-        // The detection runs once on the first segment and the prefix length
-        // is cached for the rest of the playlist (CDN headers are constant
-        // within a stream).
-        var tsPrefixBytes: Int? = null
+        // We DO cache the most-recently-seen prefix length as a hint to speed
+        // up detection on subsequent segments (we check that offset first; if
+        // it doesn't match, we fall back to a full scan).
+        var tsPrefixHint: Int = 0
 
         outFile.outputStream().use { output ->
             segmentUrls.forEachIndexed { index, segmentUrl ->
@@ -685,28 +687,29 @@ internal actual object DownloadsPlatformDownloader {
                         ciphertext
                     }
 
-                    // === Custom-prefix strip ===
-                    // Determine prefix length once from the first segment, then
-                    // apply to all subsequent segments in this playlist.
-                    val bytesToWrite = if (tsPrefixBytes == null) {
-                        // First segment (or first we can detect on): scan for TS sync.
-                        val offset = HlsPlaylistParser.findTsSyncOffset(plaintext, maxScan = 1024)
-                        if (offset > 0) {
-                            tsPrefixBytes = offset
-                        }
-                        if (offset >= 0) {
-                            plaintext.copyOfRange(offset, plaintext.size)
-                        } else {
-                            // No TS sync found in first 1KB. Could be fMP4 (handled
-                            // separately via init segment), or genuinely unknown.
-                            // Write as-is; remux pre-flight will produce a clear error.
-                            plaintext
-                        }
+                    // === Per-segment prefix detection ===
+                    // 1. Try the cached hint first (fast path).
+                    // 2. If the byte at hint offset isn't 0x47, fall back to a
+                    //    full scan up to 1024 bytes (slow path).
+                    // 3. If still no sync found, write the segment as-is and let
+                    //    the remux pre-flight produce a clear error.
+                    val offset = if (tsPrefixHint in 0..(plaintext.size - 189) &&
+                        plaintext[tsPrefixHint] == 0x47.toByte() &&
+                        plaintext[tsPrefixHint + 188] == 0x47.toByte()
+                    ) {
+                        tsPrefixHint
                     } else {
-                        // Subsequent segments: strip the same prefix length detected
-                        // on the first segment. Guard against short segments.
-                        val skip = tsPrefixBytes!!
-                        if (plaintext.size > skip) plaintext.copyOfRange(skip, plaintext.size) else plaintext
+                        val detected = HlsPlaylistParser.findTsSyncOffset(plaintext, maxScan = 1024)
+                        if (detected >= 0) {
+                            tsPrefixHint = detected
+                        }
+                        detected
+                    }
+
+                    val bytesToWrite = if (offset >= 0) {
+                        plaintext.copyOfRange(offset, plaintext.size)
+                    } else {
+                        plaintext
                     }
                     output.write(bytesToWrite)
                 }
@@ -748,6 +751,7 @@ internal actual object DownloadsPlatformDownloader {
         outFile.writeText(merged)
     }
 
+    @OptIn(UnstableApi::class)
     private fun remuxToMp4(
         videoTs: File,
         audioTsFiles: List<File>,
@@ -856,6 +860,7 @@ internal actual object DownloadsPlatformDownloader {
         // and audio tracks). We detect and extract those embedded audio tracks
         // here so the resulting MP4 is not silent.
         val candidateEmbeddedAudioIndices = mutableListOf<Int>()
+        val candidateEmbeddedAudioMimes = mutableListOf<String>()
         for (i in 0 until videoExtractor.trackCount) {
             val format = videoExtractor.getTrackFormat(i)
             val mime = format.getString(MediaFormat.KEY_MIME) ?: continue
@@ -868,6 +873,7 @@ internal actual object DownloadsPlatformDownloader {
                     // Only harvest embedded audio when no separate audio files
                     // were downloaded. Otherwise we'd duplicate the audio.
                     candidateEmbeddedAudioIndices.add(i)
+                    candidateEmbeddedAudioMimes.add(mime)
                     videoExtractor.selectTrack(i)
                 }
             }
@@ -881,6 +887,37 @@ internal actual object DownloadsPlatformDownloader {
             )
         }
 
+        // === Filter embedded audio tracks by codec support ===
+        // MediaMuxer on Android can only mux a limited set of audio codecs into
+        // MP4. The supported codecs are:
+        //   - audio/mp4a-latm (AAC)
+        //   - audio/mpeg (MP3)
+        //   - audio/3gpp (AMR)
+        //   - audio/opus (Opus, on Android 10+)
+        //
+        // Unsupported codecs that MediaExtractor can READ from TS but
+        // MediaMuxer CANNOT write to MP4 include:
+        //   - audio/ac3 (Dolby Digital)
+        //   - audio/eac3 (Dolby Digital Plus)
+        //   - audio/vnd.dts (DTS)
+        //   - audio/truehd (Dolby TrueHD)
+        //
+        // When MediaMuxer is given an unsupported audio codec, addTrack() may
+        // succeed but stop() will fail with "Failed to stop the muxer" because
+        // the codec's config bytes cannot be written to the MP4 header.
+        //
+        // Strategy: only add embedded audio tracks whose codec is in the
+        // supported set. Skip the others (the resulting MP4 will be silent
+        // or have fewer audio tracks, which is better than failing entirely).
+        val supportedAudioMimes = setOf(
+            "audio/mp4a-latm",
+            "audio/mpeg",
+            "audio/3gpp",
+            "audio/opus",
+        )
+        val supportedEmbeddedAudioIndices = candidateEmbeddedAudioIndices
+            .filterIndexed { idx, _ -> candidateEmbeddedAudioMimes[idx] in supportedAudioMimes }
+
         // === TWO-PASS for embedded audio ===
         // MediaMuxer fails at stop() with "Failed to stop the muxer" if a track
         // was added via addTrack() but never received any sample via
@@ -890,9 +927,9 @@ internal actual object DownloadsPlatformDownloader {
         //
         // MediaExtractor has no "seek to start" API; we must release and recreate
         // it for the second pass.
-        val embeddedAudioTrackIndices: List<Int> = if (candidateEmbeddedAudioIndices.isNotEmpty()) {
+        val embeddedAudioTrackIndices: List<Int> = if (supportedEmbeddedAudioIndices.isNotEmpty()) {
             val sampleCounts = mutableMapOf<Int, Long>()
-            candidateEmbeddedAudioIndices.forEach { sampleCounts[it] = 0L }
+            supportedEmbeddedAudioIndices.forEach { sampleCounts[it] = 0L }
             val countBuffer = ByteBuffer.allocateDirect(2 * 1024 * 1024)
             while (true) {
                 countBuffer.clear()
@@ -903,7 +940,7 @@ internal actual object DownloadsPlatformDownloader {
                 videoExtractor.advance()
             }
             // Only keep embedded audio tracks that have at least 1 sample.
-            candidateEmbeddedAudioIndices.filter { (sampleCounts[it] ?: 0L) > 0L }
+            supportedEmbeddedAudioIndices.filter { (sampleCounts[it] ?: 0L) > 0L }
         } else {
             emptyList()
         }
@@ -972,45 +1009,58 @@ internal actual object DownloadsPlatformDownloader {
                 audioTrackIndices.add(foundIdx)
             }
 
-            val muxer = MediaMuxer(
-                outputMp4.absolutePath,
-                MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4,
-            )
+            // === Use androidx.media3 Mp4Muxer instead of android.media.MediaMuxer ===
+            // MediaMuxer (framework) is fragile on some Android versions and
+            // MIUI/HyperOS: it fails at stop() with "Failed to stop the muxer"
+            // for several reasons (bogus KEY_DURATION, codec incompatibilities,
+            // PTS regressions). media3's Mp4Muxer is more robust, is the same
+            // engine used by ExoPlayer for the HLS playback path, is actively
+            // maintained by Google, and adds zero APK size because media3 is
+            // already a dependency of this project.
+            //
+            // MediaExtractor (framework) is still used for READING the .ts
+            // because media3 does not expose a public drop-in extractor API
+            // equivalent to MediaExtractor.selectTrack/readSampleData.
+            val muxer = Mp4Muxer.Builder(FileOutputStream(outputMp4))
+                .build()
 
             val videoFormat = vExtractor.getTrackFormat(videoTrackIndex)
-            val videoOutTrack = muxer.addTrack(videoFormat)
+            sanitizeMediaFormatDuration(videoFormat)
+            val videoOutToken = muxer.addTrack(toMedia3Format(videoFormat))
 
             // External audio tracks (one per separate .ts file).
-            val externalAudioOutTracks = audioExtractors.mapIndexed { idx, ext ->
+            val externalAudioTokens = audioExtractors.mapIndexed { idx, ext ->
                 val format = ext.getTrackFormat(audioTrackIndices[idx])
+                sanitizeMediaFormatDuration(format)
                 audioTracks.getOrNull(idx)?.language?.takeIf { it.isNotBlank() }?.let { lang ->
                     format.setString(MediaFormat.KEY_LANGUAGE, lang)
                 }
-                muxer.addTrack(format)
+                muxer.addTrack(toMedia3Format(format))
             }
 
             // Embedded audio tracks (only those that have at least 1 sample).
-            val embeddedAudioOutTracks = embeddedAudioTrackIndices.map { idx ->
-                muxer.addTrack(vExtractor.getTrackFormat(idx))
+            // Also sanitize duration on each.
+            val embeddedAudioTokens = embeddedAudioTrackIndices.map { idx ->
+                val format = vExtractor.getTrackFormat(idx)
+                sanitizeMediaFormatDuration(format)
+                muxer.addTrack(toMedia3Format(format))
             }
-
-            muxer.start()
 
             val buffer = ByteBuffer.allocateDirect(2 * 1024 * 1024)
             val bufferInfo = MediaCodec.BufferInfo()
 
-            // === Per-track sample counters (for diagnostics at stop()) ===
+            // === Per-track sample counters (for diagnostics at close()) ===
             var videoSampleCount = 0L
-            val embeddedAudioSampleCounts = LongArray(embeddedAudioOutTracks.size)
-            val externalAudioSampleCounts = LongArray(externalAudioOutTracks.size)
+            val embeddedAudioSampleCounts = LongArray(embeddedAudioTokens.size)
+            val externalAudioSampleCounts = LongArray(externalAudioTokens.size)
 
             // === PTS tracking (for monotonic validation) ===
-            // MediaMuxer requires non-decreasing PTS within each track AND
+            // Mp4Muxer requires non-decreasing PTS within each track AND
             // across tracks (when interleaved). If we see a regression, we
-            // clamp the new PTS to the previous one to avoid stop() failures.
+            // clamp the new PTS to the previous one to avoid write failures.
             var lastVideoPts: Long = Long.MIN_VALUE
-            val lastEmbeddedPts = LongArray(embeddedAudioOutTracks.size) { Long.MIN_VALUE }
-            val lastExternalPts = LongArray(externalAudioOutTracks.size) { Long.MIN_VALUE }
+            val lastEmbeddedPts = LongArray(embeddedAudioTokens.size) { Long.MIN_VALUE }
+            val lastExternalPts = LongArray(externalAudioTokens.size) { Long.MIN_VALUE }
 
             // Video + embedded audio samples are interleaved by the extractor
             // (MediaExtractor advances through samples of all selected tracks
@@ -1031,7 +1081,7 @@ internal actual object DownloadsPlatformDownloader {
                         if (pts < lastVideoPts) pts = lastVideoPts
                         lastVideoPts = pts
                         bufferInfo.presentationTimeUs = pts
-                        muxer.writeSampleData(videoOutTrack, buffer, bufferInfo)
+                        muxer.writeSampleData(videoOutToken, buffer, bufferInfo)
                         videoSampleCount++
                     }
                     else -> {
@@ -1040,7 +1090,7 @@ internal actual object DownloadsPlatformDownloader {
                             if (pts < lastEmbeddedPts[embeddedPos]) pts = lastEmbeddedPts[embeddedPos]
                             lastEmbeddedPts[embeddedPos] = pts
                             bufferInfo.presentationTimeUs = pts
-                            muxer.writeSampleData(embeddedAudioOutTracks[embeddedPos], buffer, bufferInfo)
+                            muxer.writeSampleData(embeddedAudioTokens[embeddedPos], buffer, bufferInfo)
                             embeddedAudioSampleCounts[embeddedPos]++
                         }
                         // Samples from any other (unselected) track are dropped.
@@ -1051,7 +1101,7 @@ internal actual object DownloadsPlatformDownloader {
 
             // External audio samples (each track sequentially).
             audioExtractors.forEachIndexed { idx, ext ->
-                val outTrack = externalAudioOutTracks[idx]
+                val token = externalAudioTokens[idx]
                 while (true) {
                     buffer.clear()
                     val size = ext.readSampleData(buffer, 0)
@@ -1063,65 +1113,157 @@ internal actual object DownloadsPlatformDownloader {
                     if (pts < lastExternalPts[idx]) pts = lastExternalPts[idx]
                     lastExternalPts[idx] = pts
                     bufferInfo.presentationTimeUs = pts
-                    muxer.writeSampleData(outTrack, buffer, bufferInfo)
+                    muxer.writeSampleData(token, buffer, bufferInfo)
                     externalAudioSampleCounts[idx]++
                     ext.advance()
                 }
             }
 
-            // === Diagnostics-ready stop() ===
-            // MediaMuxer.stop() can fail with "Failed to stop the muxer" for
-            // several reasons:
-            //   1. A track was added but never received any sample (we already
-            //      prevent this with the two-pass above).
-            //   2. PTS regressions that were not caught by the clamp above.
-            //   3. Codec not supported in MP4 container.
-            //   4. Sample flags invalid for the track type.
-            // Wrap stop() in try/catch to surface a useful diagnostic.
+            // === Diagnostics-ready close() ===
+            // Mp4Muxer.close() finalizes the MP4 (writes moov atom). If it
+            // fails, surface a complete diagnostic block.
             try {
-                muxer.stop()
+                muxer.close()
             } catch (e: Exception) {
-                // Build a complete diagnostic block.
                 val videoMime = videoFormat.getString(MediaFormat.KEY_MIME) ?: "unknown"
                 val videoCodec = if (videoFormat.containsKey(MediaFormat.KEY_MIME)) videoMime else "no-mime"
                 val videoDuration = if (videoFormat.containsKey(MediaFormat.KEY_DURATION)) {
                     videoFormat.getLong(MediaFormat.KEY_DURATION).toString() + " us"
                 } else "unknown"
 
-                val embeddedInfo = if (embeddedAudioOutTracks.isEmpty()) {
+                val embeddedInfo = if (embeddedAudioTokens.isEmpty()) {
                     "none"
                 } else {
-                    embeddedAudioOutTracks.indices.joinToString(", ") { i ->
-                        "track$i=${embeddedAudioSampleCounts[i]}samples" +
+                    embeddedAudioTokens.indices.joinToString(", ") { i ->
+                        val trackIdx = embeddedAudioTrackIndices[i]
+                        val mime = runCatching {
+                            vExtractor.getTrackFormat(trackIdx).getString(MediaFormat.KEY_MIME)
+                        }.getOrDefault("?")
+                        "track$i($mime)=${embeddedAudioSampleCounts[i]}samples" +
                             (if (i < lastEmbeddedPts.size) " lastPts=${lastEmbeddedPts[i]}" else "")
                     }
                 }
-                val externalInfo = if (externalAudioOutTracks.isEmpty()) {
+                val externalInfo = if (externalAudioTokens.isEmpty()) {
                     "none"
                 } else {
-                    externalAudioOutTracks.indices.joinToString(", ") { i ->
-                        "track$i=${externalAudioSampleCounts[i]}samples" +
+                    externalAudioTokens.indices.joinToString(", ") { i ->
+                        val mime = runCatching {
+                            audioExtractors[i].getTrackFormat(audioTrackIndices[i])
+                                .getString(MediaFormat.KEY_MIME)
+                        }.getOrDefault("?")
+                        "track$i($mime)=${externalAudioSampleCounts[i]}samples" +
                             (if (i < lastExternalPts.size) " lastPts=${lastExternalPts[i]}" else "")
                     }
                 }
 
+                val skippedAudioInfo = if (candidateEmbeddedAudioIndices.size != embeddedAudioTrackIndices.size) {
+                    val skippedMimes = candidateEmbeddedAudioIndices
+                        .filterIndexed { idx, _ -> candidateEmbeddedAudioMimes[idx] !in supportedAudioMimes }
+                        .mapIndexed { idx, _ -> candidateEmbeddedAudioMimes[idx] }
+                    " skippedUnsupported=${skippedMimes.joinToString(",")}"
+                } else ""
+
                 error(
-                    "MediaMuxer.stop() failed: ${e.javaClass.simpleName}: ${e.message}. " +
+                    "Mp4Muxer.close() failed: ${e.javaClass.simpleName}: ${e.message}. " +
                         "Diagnostic: videoCodec=$videoCodec, videoDuration=$videoDuration, " +
                         "videoSamples=$videoSampleCount, lastVideoPts=${if (lastVideoPts == Long.MIN_VALUE) "none" else lastVideoPts}, " +
                         "candidateEmbeddedAudio=${candidateEmbeddedAudioIndices.size}, " +
                         "activeEmbeddedAudio=${embeddedAudioTrackIndices.size} ($embeddedInfo), " +
-                        "externalAudio=${audioExtractors.size} ($externalInfo). " +
-                        "Likely causes: (a) codec unsupported by MediaMuxer (e.g. HEVC on older Android), " +
+                        "externalAudio=${audioExtractors.size} ($externalInfo),$skippedAudioInfo " +
+                        "Likely causes: (a) codec not writable to MP4 container, " +
                         "(b) PTS regressions beyond what clamping could fix, " +
                         "(c) sample format incompatibility. " +
                         "Try with a different quality variant or check device codec support.",
                 )
             }
-            muxer.release()
         } finally {
             vExtractor.release()
             audioExtractors.forEach { runCatching { it.release() } }
+        }
+    }
+
+    /**
+     * Convert an `android.media.MediaFormat` (returned by `MediaExtractor`) into
+     * an `androidx.media3.common.Format` (consumed by `Mp4Muxer.addTrack`).
+     *
+     * We only copy the fields that matter for muxing: mime type, duration,
+     * language, and codec-specific dimensions (width/height/frame-rate for
+     * video, channel-count/sample-rate for audio). All other MediaFormat keys
+     * (CSD-0, CSD-1, max-input-size, ...) are either handled internally by
+     * `MediaExtractor.readSampleData` (which prepends CSD bytes as samples with
+     * the BUFFER_FLAG_CODEC_CONFIG flag) or are not needed by `Mp4Muxer`.
+     *
+     * If the input MediaFormat has a bogus duration (negative or > 24h), it is
+     * clamped to 0 via [sanitizeMediaFormatDuration] before this function is
+     * called.
+     */
+    @OptIn(UnstableApi::class)
+    private fun toMedia3Format(mediaFormat: MediaFormat): Format {
+        val builder = Format.Builder()
+        val mime = mediaFormat.getString(MediaFormat.KEY_MIME) ?: ""
+        builder.setSampleMimeType(mime)
+
+        if (mediaFormat.containsKey(MediaFormat.KEY_DURATION)) {
+            val dur = mediaFormat.getLong(MediaFormat.KEY_DURATION)
+            // Duration already sanitized by sanitizeMediaFormatDuration(), but
+            // double-check here in case this function is called directly.
+            if (dur in 0..86_400_000_000L) {
+                builder.setDurationUs(dur)
+            }
+        }
+
+        mediaFormat.getString(MediaFormat.KEY_LANGUAGE)?.takeIf { it.isNotBlank() }?.let {
+            builder.setLanguage(it)
+        }
+
+        when {
+            mime.startsWith("video/") -> {
+                if (mediaFormat.containsKey(MediaFormat.KEY_WIDTH)) {
+                    builder.setWidth(mediaFormat.getInteger(MediaFormat.KEY_WIDTH))
+                }
+                if (mediaFormat.containsKey(MediaFormat.KEY_HEIGHT)) {
+                    builder.setHeight(mediaFormat.getInteger(MediaFormat.KEY_HEIGHT))
+                }
+                if (mediaFormat.containsKey(MediaFormat.KEY_FRAME_RATE)) {
+                    val fr = mediaFormat.getInteger(MediaFormat.KEY_FRAME_RATE)
+                    if (fr > 0) builder.setFrameRate(fr.toFloat())
+                }
+            }
+            mime.startsWith("audio/") -> {
+                if (mediaFormat.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) {
+                    builder.setChannelCount(mediaFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT))
+                }
+                if (mediaFormat.containsKey(MediaFormat.KEY_SAMPLE_RATE)) {
+                    builder.setSampleRate(mediaFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE))
+                }
+            }
+        }
+
+        return builder.build()
+    }
+
+    /**
+     * Clamp the KEY_DURATION field of a MediaFormat to a sane range.
+     *
+     * Some MediaExtractor implementations (notably on MIUI / older Android)
+     * report bogus duration values when the source TS stream has discontinuities
+     * at HLS segment boundaries. Typical bogus values are near 2^63 (interpreted
+     * as huge unsigned when formatted) or negative.
+     *
+     * Both MediaMuxer and media3's Mp4Muxer can fail at stop()/close() if the
+     * duration field is bogus, because the mvhd atom's timescale cannot
+     * represent it.
+     *
+     * Sane range: 0 to 24 hours (86_400_000_000 microseconds). Anything outside
+     * is replaced with 0 (which lets the muxer compute duration from the last
+     * written sample's PTS).
+     */
+    private fun sanitizeMediaFormatDuration(format: MediaFormat) {
+        if (!format.containsKey(MediaFormat.KEY_DURATION)) return
+        val raw = format.getLong(MediaFormat.KEY_DURATION)
+        val oneDayUs = 86_400_000_000L
+        if (raw < 0L || raw > oneDayUs) {
+            format.setLong(MediaFormat.KEY_DURATION, 0L)
         }
     }
 

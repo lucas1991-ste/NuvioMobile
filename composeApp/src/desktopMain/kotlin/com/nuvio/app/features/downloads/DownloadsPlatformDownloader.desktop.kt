@@ -508,7 +508,11 @@ internal actual object DownloadsPlatformDownloader {
         // usually able to re-sync itself by scanning the first MB, but stripping
         // the prefix explicitly is faster (no resync needed) and more robust
         // across ffmpeg builds.
-        var tsPrefixBytes: Int? = null
+        //
+        // Per-segment re-detection: the prefix length may vary across segments
+        // (different CDN nodes), so we re-detect on every segment using the
+        // previous value as a fast-path hint.
+        var tsPrefixHint: Int = 0
 
         outFile.outputStream().use { output ->
             segmentUrls.forEachIndexed { index, segmentUrl ->
@@ -569,22 +573,24 @@ internal actual object DownloadsPlatformDownloader {
                         ciphertext
                     }
 
-                    // === Custom-prefix strip ===
-                    // Same logic as the Android side: detect once from the first
-                    // segment, then apply to all subsequent segments.
-                    val bytesToWrite = if (tsPrefixBytes == null) {
-                        val offset = HlsPlaylistParser.findTsSyncOffset(plaintext, maxScan = 1024)
-                        if (offset > 0) {
-                            tsPrefixBytes = offset
-                        }
-                        if (offset >= 0) {
-                            plaintext.copyOfRange(offset, plaintext.size)
-                        } else {
-                            plaintext
-                        }
+                    // === Per-segment prefix detection (fast path + full scan) ===
+                    val offset = if (tsPrefixHint in 0..(plaintext.size - 189) &&
+                        plaintext[tsPrefixHint] == 0x47.toByte() &&
+                        plaintext[tsPrefixHint + 188] == 0x47.toByte()
+                    ) {
+                        tsPrefixHint
                     } else {
-                        val skip = tsPrefixBytes!!
-                        if (plaintext.size > skip) plaintext.copyOfRange(skip, plaintext.size) else plaintext
+                        val detected = HlsPlaylistParser.findTsSyncOffset(plaintext, maxScan = 1024)
+                        if (detected >= 0) {
+                            tsPrefixHint = detected
+                        }
+                        detected
+                    }
+
+                    val bytesToWrite = if (offset >= 0) {
+                        plaintext.copyOfRange(offset, plaintext.size)
+                    } else {
+                        plaintext
                     }
                     output.write(bytesToWrite)
                 } finally {

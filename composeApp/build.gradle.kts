@@ -919,6 +919,7 @@ kotlin {
             implementation(libs.androidx.media3.common)
             implementation(libs.androidx.media3.container)
             implementation(libs.androidx.media3.extractor)
+            implementation(libs.androidx.media3.muxer)
             implementation(fileTree(mapOf("dir" to "libs", "include" to listOf("lib-*.aar"))))
             implementation(libs.play.services.cast.framework)
             implementation(libs.androidx.mediarouter)

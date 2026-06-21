@@ -81,6 +81,7 @@ androidx-media3-session = { module = "androidx.media3:media3-session", version.r
 androidx-media3-common = { module = "androidx.media3:media3-common", version.ref = "androidx-media3" }
 androidx-media3-container = { module = "androidx.media3:media3-container", version.ref = "androidx-media3" }
 androidx-media3-extractor = { module = "androidx.media3:media3-extractor", version.ref = "androidx-media3" }
+androidx-media3-muxer = { module = "androidx.media3:media3-muxer", version.ref = "androidx-media3" }
 supabase-postgrest = { module = "io.github.jan-tennert.supabase:postgrest-kt", version.ref = "supabase" }
 supabase-auth = { module = "io.github.jan-tennert.supabase:auth-kt", version.ref = "supabase" }
 supabase-functions = { module = "io.github.jan-tennert.supabase:functions-kt", version.ref = "supabase" }
