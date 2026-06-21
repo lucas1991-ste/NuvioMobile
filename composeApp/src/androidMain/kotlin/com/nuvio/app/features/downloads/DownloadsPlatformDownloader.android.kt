@@ -855,7 +855,7 @@ internal actual object DownloadsPlatformDownloader {
         // is multiplexed inside the video segments (.ts contains both video
         // and audio tracks). We detect and extract those embedded audio tracks
         // here so the resulting MP4 is not silent.
-        val embeddedAudioTrackIndices = mutableListOf<Int>()
+        val candidateEmbeddedAudioIndices = mutableListOf<Int>()
         for (i in 0 until videoExtractor.trackCount) {
             val format = videoExtractor.getTrackFormat(i)
             val mime = format.getString(MediaFormat.KEY_MIME) ?: continue
@@ -867,7 +867,7 @@ internal actual object DownloadsPlatformDownloader {
                 mime.startsWith("audio/") && audioTsFiles.isEmpty() -> {
                     // Only harvest embedded audio when no separate audio files
                     // were downloaded. Otherwise we'd duplicate the audio.
-                    embeddedAudioTrackIndices.add(i)
+                    candidateEmbeddedAudioIndices.add(i)
                     videoExtractor.selectTrack(i)
                 }
             }
@@ -880,6 +880,51 @@ internal actual object DownloadsPlatformDownloader {
                     "The file may have been corrupted during download.",
             )
         }
+
+        // === TWO-PASS for embedded audio ===
+        // MediaMuxer fails at stop() with "Failed to stop the muxer" if a track
+        // was added via addTrack() but never received any sample via
+        // writeSampleData(). To avoid this, we do a first pass to count samples
+        // per candidate embedded audio track, and only add to the muxer the
+        // tracks that will actually have content.
+        //
+        // MediaExtractor has no "seek to start" API; we must release and recreate
+        // it for the second pass.
+        val embeddedAudioTrackIndices: List<Int> = if (candidateEmbeddedAudioIndices.isNotEmpty()) {
+            val sampleCounts = mutableMapOf<Int, Long>()
+            candidateEmbeddedAudioIndices.forEach { sampleCounts[it] = 0L }
+            val countBuffer = ByteBuffer.allocateDirect(2 * 1024 * 1024)
+            while (true) {
+                countBuffer.clear()
+                val size = videoExtractor.readSampleData(countBuffer, 0)
+                if (size < 0) break
+                val trackIdx = videoExtractor.sampleTrackIndex
+                sampleCounts[trackIdx] = (sampleCounts[trackIdx] ?: 0L) + 1L
+                videoExtractor.advance()
+            }
+            // Only keep embedded audio tracks that have at least 1 sample.
+            candidateEmbeddedAudioIndices.filter { (sampleCounts[it] ?: 0L) > 0L }
+        } else {
+            emptyList()
+        }
+
+        // === Recreate the extractor for the actual muxing pass ===
+        // The first pass (or even just the initial track enumeration) has
+        // advanced the extractor's internal cursor; we need a fresh one
+        // positioned at the start of the file.
+        videoExtractor.release()
+        val vExtractor = MediaExtractor()
+        try {
+            vExtractor.setDataSource(videoTs.absolutePath)
+        } catch (e: Exception) {
+            vExtractor.release()
+            error(
+                "MediaExtractor failed on second pass for ${videoTs.name}: " +
+                    "${e.javaClass.simpleName}: ${e.message}",
+            )
+        }
+        vExtractor.selectTrack(videoTrackIndex)
+        embeddedAudioTrackIndices.forEach { vExtractor.selectTrack(it) }
 
         val audioExtractors = mutableListOf<MediaExtractor>()
         val audioTrackIndices = mutableListOf<Int>()
@@ -932,7 +977,8 @@ internal actual object DownloadsPlatformDownloader {
                 MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4,
             )
 
-            val videoOutTrack = muxer.addTrack(videoExtractor.getTrackFormat(videoTrackIndex))
+            val videoFormat = vExtractor.getTrackFormat(videoTrackIndex)
+            val videoOutTrack = muxer.addTrack(videoFormat)
 
             // External audio tracks (one per separate .ts file).
             val externalAudioOutTracks = audioExtractors.mapIndexed { idx, ext ->
@@ -943,10 +989,9 @@ internal actual object DownloadsPlatformDownloader {
                 muxer.addTrack(format)
             }
 
-            // Embedded audio tracks (harvested from the video.ts when no
-            // separate audio files were provided).
+            // Embedded audio tracks (only those that have at least 1 sample).
             val embeddedAudioOutTracks = embeddedAudioTrackIndices.map { idx ->
-                muxer.addTrack(videoExtractor.getTrackFormat(idx))
+                muxer.addTrack(vExtractor.getTrackFormat(idx))
             }
 
             muxer.start()
@@ -954,30 +999,54 @@ internal actual object DownloadsPlatformDownloader {
             val buffer = ByteBuffer.allocateDirect(2 * 1024 * 1024)
             val bufferInfo = MediaCodec.BufferInfo()
 
+            // === Per-track sample counters (for diagnostics at stop()) ===
+            var videoSampleCount = 0L
+            val embeddedAudioSampleCounts = LongArray(embeddedAudioOutTracks.size)
+            val externalAudioSampleCounts = LongArray(externalAudioOutTracks.size)
+
+            // === PTS tracking (for monotonic validation) ===
+            // MediaMuxer requires non-decreasing PTS within each track AND
+            // across tracks (when interleaved). If we see a regression, we
+            // clamp the new PTS to the previous one to avoid stop() failures.
+            var lastVideoPts: Long = Long.MIN_VALUE
+            val lastEmbeddedPts = LongArray(embeddedAudioOutTracks.size) { Long.MIN_VALUE }
+            val lastExternalPts = LongArray(externalAudioOutTracks.size) { Long.MIN_VALUE }
+
             // Video + embedded audio samples are interleaved by the extractor
             // (MediaExtractor advances through samples of all selected tracks
             // in presentation order). We route each sample to its destination
             // track based on which track the extractor is currently at.
             while (true) {
                 buffer.clear()
-                val size = videoExtractor.readSampleData(buffer, 0)
+                val size = vExtractor.readSampleData(buffer, 0)
                 if (size < 0) break
                 bufferInfo.offset = 0
                 bufferInfo.size = size
-                bufferInfo.flags = videoExtractor.sampleFlags
-                bufferInfo.presentationTimeUs = videoExtractor.sampleTime
-                val currentTrack = videoExtractor.sampleTrackIndex
+                bufferInfo.flags = vExtractor.sampleFlags
+                var pts = vExtractor.sampleTime
+                val currentTrack = vExtractor.sampleTrackIndex
                 when (currentTrack) {
-                    videoTrackIndex -> muxer.writeSampleData(videoOutTrack, buffer, bufferInfo)
+                    videoTrackIndex -> {
+                        // Enforce monotonic PTS (clamp if regression).
+                        if (pts < lastVideoPts) pts = lastVideoPts
+                        lastVideoPts = pts
+                        bufferInfo.presentationTimeUs = pts
+                        muxer.writeSampleData(videoOutTrack, buffer, bufferInfo)
+                        videoSampleCount++
+                    }
                     else -> {
                         val embeddedPos = embeddedAudioTrackIndices.indexOf(currentTrack)
                         if (embeddedPos >= 0) {
+                            if (pts < lastEmbeddedPts[embeddedPos]) pts = lastEmbeddedPts[embeddedPos]
+                            lastEmbeddedPts[embeddedPos] = pts
+                            bufferInfo.presentationTimeUs = pts
                             muxer.writeSampleData(embeddedAudioOutTracks[embeddedPos], buffer, bufferInfo)
+                            embeddedAudioSampleCounts[embeddedPos]++
                         }
                         // Samples from any other (unselected) track are dropped.
                     }
                 }
-                videoExtractor.advance()
+                vExtractor.advance()
             }
 
             // External audio samples (each track sequentially).
@@ -990,16 +1059,68 @@ internal actual object DownloadsPlatformDownloader {
                     bufferInfo.offset = 0
                     bufferInfo.size = size
                     bufferInfo.flags = ext.sampleFlags
-                    bufferInfo.presentationTimeUs = ext.sampleTime
+                    var pts = ext.sampleTime
+                    if (pts < lastExternalPts[idx]) pts = lastExternalPts[idx]
+                    lastExternalPts[idx] = pts
+                    bufferInfo.presentationTimeUs = pts
                     muxer.writeSampleData(outTrack, buffer, bufferInfo)
+                    externalAudioSampleCounts[idx]++
                     ext.advance()
                 }
             }
 
-            muxer.stop()
+            // === Diagnostics-ready stop() ===
+            // MediaMuxer.stop() can fail with "Failed to stop the muxer" for
+            // several reasons:
+            //   1. A track was added but never received any sample (we already
+            //      prevent this with the two-pass above).
+            //   2. PTS regressions that were not caught by the clamp above.
+            //   3. Codec not supported in MP4 container.
+            //   4. Sample flags invalid for the track type.
+            // Wrap stop() in try/catch to surface a useful diagnostic.
+            try {
+                muxer.stop()
+            } catch (e: Exception) {
+                // Build a complete diagnostic block.
+                val videoMime = videoFormat.getString(MediaFormat.KEY_MIME) ?: "unknown"
+                val videoCodec = if (videoFormat.containsKey(MediaFormat.KEY_MIME)) videoMime else "no-mime"
+                val videoDuration = if (videoFormat.containsKey(MediaFormat.KEY_DURATION)) {
+                    videoFormat.getLong(MediaFormat.KEY_DURATION).toString() + " us"
+                } else "unknown"
+
+                val embeddedInfo = if (embeddedAudioOutTracks.isEmpty()) {
+                    "none"
+                } else {
+                    embeddedAudioOutTracks.indices.joinToString(", ") { i ->
+                        "track$i=${embeddedAudioSampleCounts[i]}samples" +
+                            (if (i < lastEmbeddedPts.size) " lastPts=${lastEmbeddedPts[i]}" else "")
+                    }
+                }
+                val externalInfo = if (externalAudioOutTracks.isEmpty()) {
+                    "none"
+                } else {
+                    externalAudioOutTracks.indices.joinToString(", ") { i ->
+                        "track$i=${externalAudioSampleCounts[i]}samples" +
+                            (if (i < lastExternalPts.size) " lastPts=${lastExternalPts[i]}" else "")
+                    }
+                }
+
+                error(
+                    "MediaMuxer.stop() failed: ${e.javaClass.simpleName}: ${e.message}. " +
+                        "Diagnostic: videoCodec=$videoCodec, videoDuration=$videoDuration, " +
+                        "videoSamples=$videoSampleCount, lastVideoPts=${if (lastVideoPts == Long.MIN_VALUE) "none" else lastVideoPts}, " +
+                        "candidateEmbeddedAudio=${candidateEmbeddedAudioIndices.size}, " +
+                        "activeEmbeddedAudio=${embeddedAudioTrackIndices.size} ($embeddedInfo), " +
+                        "externalAudio=${audioExtractors.size} ($externalInfo). " +
+                        "Likely causes: (a) codec unsupported by MediaMuxer (e.g. HEVC on older Android), " +
+                        "(b) PTS regressions beyond what clamping could fix, " +
+                        "(c) sample format incompatibility. " +
+                        "Try with a different quality variant or check device codec support.",
+                )
+            }
             muxer.release()
         } finally {
-            videoExtractor.release()
+            vExtractor.release()
             audioExtractors.forEach { runCatching { it.release() } }
         }
     }
