@@ -245,10 +245,8 @@ internal actual object DownloadsPlatformDownloader {
         }
     }
 
-    actual fun downloadHlsSegments(
-        segmentUrls: List<String>,
-        sourceHeaders: Map<String, String>,
-        destinationFileName: String,
+    actual fun downloadAndRemuxHls(
+        request: HlsRemuxRequest,
         onProgress: (downloadedBytes: Long, totalBytes: Long?) -> Unit,
         onSuccess: (localFileUri: String, totalBytes: Long?) -> Unit,
         onFailure: (message: String) -> Unit,
@@ -258,70 +256,9 @@ internal actual object DownloadsPlatformDownloader {
         val handle = IosDownloadsTaskHandle(job)
 
         scope.launch {
-            val downloadsDirectory = downloadsDirectoryPath()
-            val destinationPath = "$downloadsDirectory/$destinationFileName"
-            val tempPath = "$downloadsDirectory/$destinationFileName.hls.part"
-            var totalDownloaded = 0L
-
-            try {
-                removePathIfExists(tempPath)
-
-                for (segmentUrl in segmentUrls) {
-                    ensureActive()
-
-                    val url = NSURL(string = segmentUrl)
-                    val request = NSMutableURLRequest(
-                        uRL = url,
-                        cachePolicy = NSURLRequestReloadIgnoringLocalCacheData,
-                        timeoutInterval = 60.0,
-                    )
-                    request.setHTTPMethod("GET")
-                    sourceHeaders.forEach { (key, value) ->
-                        request.setValue(value, forHTTPHeaderField = key)
-                    }
-
-                    val semaphore = dispatch_semaphore_create(0)
-                    var segmentError: Throwable? = null
-
-                    val task = NSURLSession.sharedSession.dataTaskWithRequest(request) { data, _, error ->
-                        if (error != null) {
-                            segmentError = IllegalStateException(error.localizedDescription)
-                        } else if (data != null) {
-                            val file = fopen(tempPath, "ab")
-                            if (file != null) {
-                                fwrite(data.bytes, 1.convert(), data.length.toLong().convert(), file)
-                                fflush(file)
-                                fclose(file)
-                                totalDownloaded += data.length.toLong()
-                                onProgress(totalDownloaded, null)
-                            }
-                        }
-                        dispatch_semaphore_signal(semaphore)
-                    }
-                    task.resume()
-                    dispatch_semaphore_wait(semaphore, DISPATCH_TIME_FOREVER)
-
-                    if (segmentError != null) throw segmentError!!
-                }
-
-                removePathIfExists(destinationPath)
-                val moved = NSFileManager.defaultManager.moveItemAtPath(
-                    srcPath = tempPath,
-                    toPath = destinationPath,
-                    error = null,
-                )
-                if (!moved) {
-                    error(runBlocking { getString(Res.string.downloads_error_finalize_file_failed) })
-                }
-
-                val localFileUri = NSURL.fileURLWithPath(destinationPath).absoluteString ?: "file://$destinationPath"
-                val finalSize = fileSizeOrNull(destinationPath)
-                onSuccess(localFileUri, finalSize)
-            } catch (_: CancellationException) {
-                handle.cancelNativeTask()
-            } catch (error: Throwable) {
-                onFailure(error.message ?: runBlocking { getString(Res.string.download_failed) })
-            }
+            // iOS remux implementation is not yet available. Use AVAssetExportSession
+            // or AVAssetWriter in a future iteration. For now, fail with a clear message.
+            onFailure("HLS multi-track remux is not yet supported on iOS")
         }
 
         return handle

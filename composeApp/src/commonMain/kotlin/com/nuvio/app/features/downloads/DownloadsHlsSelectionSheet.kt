@@ -1,15 +1,24 @@
 package com.nuvio.app.features.downloads
 
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import com.nuvio.app.core.ui.rememberNuvioBottomSheetState
 import androidx.compose.runtime.Composable
@@ -37,10 +46,14 @@ import kotlinx.coroutines.withContext
 import nuvio.composeapp.generated.resources.Res
 import nuvio.composeapp.generated.resources.download_failed
 import nuvio.composeapp.generated.resources.downloads_hls_audio
+import nuvio.composeapp.generated.resources.downloads_hls_audio_hint
 import nuvio.composeapp.generated.resources.downloads_hls_download
 import nuvio.composeapp.generated.resources.downloads_hls_fetching
+import nuvio.composeapp.generated.resources.downloads_hls_no_audio
+import nuvio.composeapp.generated.resources.downloads_hls_no_subtitles
 import nuvio.composeapp.generated.resources.downloads_hls_quality
 import nuvio.composeapp.generated.resources.downloads_hls_select_variant
+import nuvio.composeapp.generated.resources.downloads_hls_subtitle_hint
 import nuvio.composeapp.generated.resources.downloads_hls_subtitles
 import org.jetbrains.compose.resources.stringResource
 
@@ -95,54 +108,24 @@ fun DownloadsHlsSelectionSheet(
         }.orEmpty()
     }
 
-    val audioOptions = remember(playlist) {
-        playlist?.audioTracks?.map { track ->
-            NuvioDropdownOption(
-                key = track.uri ?: "none",
-                label = buildString {
-                    append(track.name)
-                    track.language?.let { lang ->
-                        if (lang.isNotBlank()) {
-                            append(" • ")
-                            append(lang)
-                        }
-                    }
-                },
-            )
-        }.orEmpty()
+    // Audio tracks: multi-select. Default = the track flagged DEFAULT in the master playlist.
+    val audioTracks = remember(playlist) { playlist?.audioTracks.orEmpty() }
+    var selectedAudioUrls by remember(audioTracks) {
+        mutableStateOf(audioTracks.filter { it.isDefault }.map { it.uri ?: "" }.toSet())
     }
 
-    val subtitleOptions = remember(playlist) {
-        listOf(
-            NuvioDropdownOption(key = "none", label = "None"),
-        ) + (playlist?.subtitleTracks?.map { track ->
-            NuvioDropdownOption(
-                key = track.uri ?: "none",
-                label = buildString {
-                    append(track.name)
-                    track.language?.let { lang ->
-                        if (lang.isNotBlank()) {
-                            append(" • ")
-                            append(lang)
-                        }
-                    }
-                },
-            )
-        }.orEmpty())
+    // Subtitle tracks: multi-select. Default = empty (no subtitles).
+    val subtitleTracks = remember(playlist) { playlist?.subtitleTracks.orEmpty() }
+    var selectedSubtitleUrls by remember(subtitleTracks) {
+        mutableStateOf(emptySet<String>())
     }
 
     var selectedQualityKey by remember(qualityOptions) {
         mutableStateOf(qualityOptions.firstOrNull()?.key)
     }
-    var selectedAudioKey by remember(audioOptions) {
-        mutableStateOf(audioOptions.firstOrNull()?.key)
-    }
-    var selectedSubtitleKey by remember(subtitleOptions) {
-        mutableStateOf("none")
-    }
 
-    val hasAudio = audioOptions.isNotEmpty()
-    val hasSubtitles = subtitleOptions.size > 1
+    val hasAudio = audioTracks.isNotEmpty()
+    val hasSubtitles = subtitleTracks.isNotEmpty()
     val canDownload = qualityOptions.isNotEmpty()
 
     NuvioModalBottomSheet(
@@ -194,6 +177,7 @@ fun DownloadsHlsSelectionSheet(
                         )
                     }
                 }
+
                 isFetching || qualityOptions.isEmpty() -> {
                     Box(
                         modifier = Modifier
@@ -213,6 +197,7 @@ fun DownloadsHlsSelectionSheet(
                         )
                     }
                 }
+
                 else -> {
                     Column(
                         modifier = Modifier
@@ -220,6 +205,7 @@ fun DownloadsHlsSelectionSheet(
                             .padding(horizontal = 16.dp),
                         verticalArrangement = Arrangement.spacedBy(12.dp),
                     ) {
+                        // === Quality (single-select) ===
                         Text(
                             text = stringResource(Res.string.downloads_hls_quality),
                             style = MaterialTheme.typography.labelLarge,
@@ -235,6 +221,7 @@ fun DownloadsHlsSelectionSheet(
                             },
                         )
 
+                        // === Audio tracks (multi-select) ===
                         if (hasAudio) {
                             Spacer(modifier = Modifier.height(4.dp))
                             Text(
@@ -242,17 +229,43 @@ fun DownloadsHlsSelectionSheet(
                                 style = MaterialTheme.typography.labelLarge,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
-                            NuvioDropdownChip(
-                                title = stringResource(Res.string.downloads_hls_audio),
-                                label = audioOptions.firstOrNull { it.key == selectedAudioKey }?.label.orEmpty(),
-                                selectedKey = selectedAudioKey,
-                                options = audioOptions,
-                                onSelected = { option ->
-                                    selectedAudioKey = option.key
-                                },
+                            Text(
+                                text = stringResource(Res.string.downloads_hls_audio_hint),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            LazyColumn(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .heightIn(max = 240.dp),
+                                verticalArrangement = Arrangement.spacedBy(2.dp),
+                            ) {
+                                items(audioTracks) { track ->
+                                    val trackUri = track.uri ?: ""
+                                    val isSelected = trackUri in selectedAudioUrls
+                                    SelectableTrackRow(
+                                        name = track.name,
+                                        language = track.language,
+                                        isSelected = isSelected,
+                                        onToggle = {
+                                            selectedAudioUrls = if (isSelected) {
+                                                selectedAudioUrls - trackUri
+                                            } else {
+                                                selectedAudioUrls + trackUri
+                                            }
+                                        },
+                                    )
+                                }
+                            }
+                        } else {
+                            Text(
+                                text = stringResource(Res.string.downloads_hls_no_audio),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
                         }
 
+                        // === Subtitle tracks (multi-select) ===
                         if (hasSubtitles) {
                             Spacer(modifier = Modifier.height(4.dp))
                             Text(
@@ -260,14 +273,39 @@ fun DownloadsHlsSelectionSheet(
                                 style = MaterialTheme.typography.labelLarge,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
-                            NuvioDropdownChip(
-                                title = stringResource(Res.string.downloads_hls_subtitles),
-                                label = subtitleOptions.firstOrNull { it.key == selectedSubtitleKey }?.label.orEmpty(),
-                                selectedKey = selectedSubtitleKey,
-                                options = subtitleOptions,
-                                onSelected = { option ->
-                                    selectedSubtitleKey = option.key
-                                },
+                            Text(
+                                text = stringResource(Res.string.downloads_hls_subtitle_hint),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            LazyColumn(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .heightIn(max = 240.dp),
+                                verticalArrangement = Arrangement.spacedBy(2.dp),
+                            ) {
+                                items(subtitleTracks) { track ->
+                                    val trackUri = track.uri ?: ""
+                                    val isSelected = trackUri in selectedSubtitleUrls
+                                    SelectableTrackRow(
+                                        name = track.name,
+                                        language = track.language,
+                                        isSelected = isSelected,
+                                        onToggle = {
+                                            selectedSubtitleUrls = if (isSelected) {
+                                                selectedSubtitleUrls - trackUri
+                                            } else {
+                                                selectedSubtitleUrls + trackUri
+                                            }
+                                        },
+                                    )
+                                }
+                            }
+                        } else {
+                            Text(
+                                text = stringResource(Res.string.downloads_hls_no_subtitles),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
                         }
 
@@ -280,18 +318,30 @@ fun DownloadsHlsSelectionSheet(
                                 val selectedVariant = playlist?.variants?.firstOrNull {
                                     it.url == selectedQualityKey
                                 }
+                                val audioSelections = audioTracks
+                                    .filter { (it.uri ?: "") in selectedAudioUrls }
+                                    .map { track ->
+                                        HlsTrackSelection(
+                                            url = track.uri.orEmpty(),
+                                            name = track.name,
+                                            language = track.language,
+                                        )
+                                    }
+                                val subtitleSelections = subtitleTracks
+                                    .filter { (it.uri ?: "") in selectedSubtitleUrls }
+                                    .map { track ->
+                                        HlsTrackSelection(
+                                            url = track.uri.orEmpty(),
+                                            name = track.name,
+                                            language = track.language,
+                                        )
+                                    }
                                 val selection = HlsDownloadSelection(
                                     variantUrl = selectedQualityKey.orEmpty(),
-                                    audioUrl = selectedAudioKey?.takeIf { it != "none" },
-                                    subtitleUrl = selectedSubtitleKey?.takeIf { it != "none" },
+                                    audioTracks = audioSelections,
+                                    subtitleTracks = subtitleSelections,
                                     displayQuality = selectedVariant?.resolution
                                         ?: formatBandwidth(selectedVariant?.bandwidth ?: 0L),
-                                    displayAudio = if (hasAudio) {
-                                        audioOptions.firstOrNull { it.key == selectedAudioKey }?.label.orEmpty()
-                                    } else "",
-                                    displaySubtitle = if (hasSubtitles && selectedSubtitleKey != "none") {
-                                        subtitleOptions.firstOrNull { it.key == selectedSubtitleKey }?.label.orEmpty()
-                                    } else "",
                                 )
                                 coroutineScope.launch {
                                     dismissNuvioBottomSheet(sheetState = sheetState, onDismiss = {
@@ -303,6 +353,56 @@ fun DownloadsHlsSelectionSheet(
 
                         Spacer(modifier = Modifier.height(8.dp))
                     }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SelectableTrackRow(
+    name: String,
+    language: String?,
+    isSelected: Boolean,
+    onToggle: () -> Unit,
+) {
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onToggle),
+        shape = RoundedCornerShape(8.dp),
+        color = if (isSelected) {
+            MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.4f)
+        } else {
+            MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f)
+        },
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Checkbox(
+                checked = isSelected,
+                onCheckedChange = { onToggle() },
+                modifier = Modifier.size(24.dp),
+            )
+            Column {
+                Text(
+                    text = name,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                language?.takeIf { it.isNotBlank() }?.let { lang ->
+                    Text(
+                        text = lang,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                 }
             }
         }

@@ -203,13 +203,29 @@ object DownloadsRepository {
         }
 
         val downloadId = nextDownloadId(now)
+        val audioDisplay = selection.audioTracks.joinToString(", ") { track ->
+            buildString {
+                append(track.name)
+                track.language?.takeIf { it.isNotBlank() }?.let { append(" ($it)") }
+            }
+        }
+        val subtitleDisplay = selection.subtitleTracks.joinToString(", ") { track ->
+            buildString {
+                append(track.name)
+                track.language?.takeIf { it.isNotBlank() }?.let { append(" ($it)") }
+            }
+        }
         val displayInfo = buildString {
             append(title)
             append(" • ")
             append(selection.displayQuality)
-            if (selection.displayAudio.isNotBlank()) {
+            if (audioDisplay.isNotBlank()) {
                 append(" • ")
-                append(selection.displayAudio)
+                append(audioDisplay)
+            }
+            if (subtitleDisplay.isNotBlank()) {
+                append(" • ")
+                append(subtitleDisplay)
             }
         }
         val fileName = buildHlsFileName(
@@ -252,8 +268,12 @@ object DownloadsRepository {
             createdAtEpochMs = now,
             updatedAtEpochMs = now,
             isHls = true,
-            hlsAudioUrl = selection.audioUrl,
-            hlsSubtitleUrl = selection.subtitleUrl,
+            hlsAudioTracks = selection.audioTracks.map {
+                HlsTrackRef(url = it.url, name = it.name, language = it.language)
+            },
+            hlsSubtitleTracks = selection.subtitleTracks.map {
+                HlsTrackRef(url = it.url, name = it.name, language = it.language)
+            },
         )
 
         currentItems.add(0, item)
@@ -519,11 +539,12 @@ object DownloadsRepository {
         val scope = CoroutineScope(job + Dispatchers.Default)
 
         scope.launch {
-            val mediaContent = DownloadsPlatformDownloader.fetchUrlAsString(
+            // Verifica che la playlist video esista e non sia cifrata
+            val videoContent = DownloadsPlatformDownloader.fetchUrlAsString(
                 url = item.sourceUrl,
                 headers = item.sourceHeaders,
             )
-            if (mediaContent == null) {
+            if (videoContent == null) {
                 val errorMsg = runBlocking { getString(Res.string.download_failed) }
                 mutateItem(item.id) { current ->
                     current.copy(
@@ -535,7 +556,7 @@ object DownloadsRepository {
                 return@launch
             }
 
-            val mediaPlaylist = HlsPlaylistParser.parseMediaPlaylist(mediaContent, item.sourceUrl)
+            val mediaPlaylist = HlsPlaylistParser.parseMediaPlaylist(videoContent, item.sourceUrl)
             if (mediaPlaylist.segments.isEmpty()) {
                 val errorMsg = runBlocking { getString(Res.string.download_failed) }
                 mutateItem(item.id) { current ->
@@ -547,13 +568,47 @@ object DownloadsRepository {
                 }
                 return@launch
             }
+            if (mediaPlaylist.isEncrypted) {
+                val errorMsg = runBlocking { getString(Res.string.downloads_error_hls_encrypted) }
+                mutateItem(item.id) { current ->
+                    current.copy(
+                        status = DownloadStatus.Failed,
+                        errorMessage = errorMsg,
+                        updatedAtEpochMs = DownloadsClock.nowEpochMs(),
+                    )
+                }
+                return@launch
+            }
 
-            val segmentUrls = mediaPlaylist.segments.map { it.url }
-
-            val handle = DownloadsPlatformDownloader.downloadHlsSegments(
-                segmentUrls = segmentUrls,
+            val request = HlsRemuxRequest(
+                video = HlsRemuxTrack(
+                    playlistUrl = item.sourceUrl,
+                    name = "Video",
+                    language = null,
+                    kind = HlsRemuxTrackKind.VIDEO,
+                ),
+                audioTracks = item.hlsAudioTracks.mapIndexed { index, track ->
+                    HlsRemuxTrack(
+                        playlistUrl = track.url,
+                        name = track.name.ifBlank { "Audio ${index + 1}" },
+                        language = track.language,
+                        kind = HlsRemuxTrackKind.AUDIO,
+                    )
+                },
+                subtitleTracks = item.hlsSubtitleTracks.mapIndexed { index, track ->
+                    HlsRemuxTrack(
+                        playlistUrl = track.url,
+                        name = track.name.ifBlank { "Subtitles ${index + 1}" },
+                        language = track.language,
+                        kind = HlsRemuxTrackKind.SUBTITLE,
+                    )
+                },
                 sourceHeaders = item.sourceHeaders,
                 destinationFileName = item.fileName,
+            )
+
+            val handle = DownloadsPlatformDownloader.downloadAndRemuxHls(
+                request = request,
                 onProgress = { downloadedBytes, totalBytes ->
                     mutateItem(item.id) { current ->
                         if (current.status != DownloadStatus.Downloading) {
@@ -816,7 +871,7 @@ private fun buildHlsFileName(
         }
         append('_')
         append(nowEpochMs.toString(36))
-        append(".ts")
+        append(".mp4")
     }
 }
 

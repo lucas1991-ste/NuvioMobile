@@ -48,8 +48,8 @@ data class DownloadItem(
     val createdAtEpochMs: Long,
     val updatedAtEpochMs: Long,
     val isHls: Boolean = false,
-    val hlsAudioUrl: String? = null,
-    val hlsSubtitleUrl: String? = null,
+    val hlsAudioTracks: List<HlsTrackRef> = emptyList(),
+    val hlsSubtitleTracks: List<HlsTrackRef> = emptyList(),
 ) {
     val isEpisode: Boolean
         get() = seasonNumber != null && episodeNumber != null
@@ -106,11 +106,22 @@ enum class DownloadEnqueueResult {
 
 data class HlsDownloadSelection(
     val variantUrl: String,
-    val audioUrl: String? = null,
-    val subtitleUrl: String? = null,
+    val audioTracks: List<HlsTrackSelection> = emptyList(),
+    val subtitleTracks: List<HlsTrackSelection> = emptyList(),
     val displayQuality: String = "",
-    val displayAudio: String = "",
-    val displaySubtitle: String = "",
+)
+
+@Serializable
+data class HlsTrackRef(
+    val url: String,
+    val name: String,
+    val language: String? = null,
+)
+
+data class HlsTrackSelection(
+    val url: String,
+    val name: String,
+    val language: String? = null,
 )
 
 data class HlsStreamMetadata(

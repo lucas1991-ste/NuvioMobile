@@ -26,11 +26,13 @@ data class HlsMasterPlaylist(
 data class HlsMediaPlaylist(
     val segments: List<HlsSegment>,
     val targetDuration: Double = 0.0,
+    val isEncrypted: Boolean = false,
 )
 
 data class HlsSegment(
     val duration: Double,
     val url: String,
+    val discontinuity: Boolean = false,
 )
 
 object HlsPlaylistParser {
@@ -111,6 +113,8 @@ object HlsPlaylistParser {
         val segments = mutableListOf<HlsSegment>()
         var targetDuration = 0.0
         var currentDuration = 0.0
+        var pendingDiscontinuity = false
+        var isEncrypted = false
 
         for (line in lines) {
             val trimmed = line.trim()
@@ -118,19 +122,127 @@ object HlsPlaylistParser {
                 trimmed.startsWith("#EXT-X-TARGETDURATION:") -> {
                     targetDuration = trimmed.substringAfter(":").trim().toDoubleOrNull() ?: 0.0
                 }
+                trimmed.startsWith("#EXT-X-KEY:") -> {
+                    val attrs = parseAttributes(trimmed.removePrefix("#EXT-X-KEY:"))
+                    val method = attrs["METHOD"]?.trim()?.uppercase() ?: ""
+                    if (method != "NONE") isEncrypted = true
+                }
+                trimmed.startsWith("#EXT-X-DISCONTINUITY") && !trimmed.startsWith("#EXT-X-DISCONTINUITY-SEQUENCE") -> {
+                    pendingDiscontinuity = true
+                }
                 trimmed.startsWith("#EXTINF:") -> {
                     val durationStr = trimmed.substringAfter(":").substringBefore(",").trim()
                     currentDuration = durationStr.toDoubleOrNull() ?: 0.0
                 }
                 !trimmed.startsWith("#") && trimmed.isNotBlank() -> {
                     val segmentUrl = resolveUrl(trimmed, baseUrl)
-                    segments.add(HlsSegment(currentDuration, segmentUrl))
+                    segments.add(
+                        HlsSegment(
+                            duration = currentDuration,
+                            url = segmentUrl,
+                            discontinuity = pendingDiscontinuity,
+                        ),
+                    )
                     currentDuration = 0.0
+                    pendingDiscontinuity = false
                 }
             }
         }
 
-        return HlsMediaPlaylist(segments, targetDuration)
+        return HlsMediaPlaylist(segments, targetDuration, isEncrypted)
+    }
+
+    /**
+     * Concatena segmenti WebVTT (tipicamente da playlist HLS subtitle) in un singolo
+     * documento WebVTT coerente, ricalcolando i timestamp cumulative.
+     *
+     * Restituisce il testo WebVTT completo, pronto da salvare come `.vtt` sidecar.
+     */
+    fun concatWebVttSegments(
+        segmentContents: List<String>,
+        segmentDurationsSec: List<Double>,
+    ): String {
+        val sb = StringBuilder()
+        sb.append("WEBVTT\n\n")
+        var timeOffsetMs = 0L
+
+        for ((index, content) in segmentContents.withIndex()) {
+            val segDurationMs = ((segmentDurationsSec.getOrNull(index) ?: 0.0) * 1000.0).toLong()
+            val cueBlocks = content
+                .replace("\r\n", "\n")
+                .replace("\r", "\n")
+                .trim()
+                .removePrefix("WEBVTT")
+                .trimStart('\n')
+                .split("\n\n")
+                .filter { it.isNotBlank() }
+
+            for (block in cueBlocks) {
+                val lines = block.lines().toMutableList()
+                // Trova la riga del timing
+                val timingIdx = lines.indexOfFirst { line ->
+                    Regex("""^\s*\d{2}:\d{2}:\d{2}\.\d{3}\s*-->""").containsMatchIn(line) ||
+                        Regex("""^\s*\d{2}:\d{2}\.\d{3}\s*-->""").containsMatchIn(line)
+                }
+                if (timingIdx == -1) continue
+
+                val timingLine = lines[timingIdx].trim()
+                val (startStr, rest) = timingLine.substringBefore(" --> ").let { it to timingLine.substringAfter(" --> ") }
+                val endStr = rest.substringBefore(" ").trim()
+
+                val startMs = parseVttTimestamp(startStr)
+                val endMs = parseVttTimestamp(endStr)
+                if (startMs == null || endMs == null) continue
+
+                val newStart = startMs + timeOffsetMs
+                val newEnd = endMs + timeOffsetMs
+                lines[timingIdx] = "${formatVttTimestamp(newStart)} --> ${formatVttTimestamp(newEnd)}"
+
+                sb.append(lines.joinToString("\n"))
+                sb.append("\n\n")
+            }
+
+            timeOffsetMs += segDurationMs
+        }
+
+        return sb.toString()
+    }
+
+    private fun parseVttTimestamp(value: String): Long? {
+        val trimmed = value.trim()
+        // HH:MM:SS.mmm oppure MM:SS.mmm
+        val parts = trimmed.split(":")
+        return try {
+            when (parts.size) {
+                3 -> {
+                    val h = parts[0].toLong()
+                    val m = parts[1].toLong()
+                    val sParts = parts[2].split(".")
+                    val s = sParts[0].toLong()
+                    val ms = if (sParts.size > 1) sParts[1].padEnd(3, '0').take(3).toLong() else 0L
+                    h * 3_600_000L + m * 60_000L + s * 1_000L + ms
+                }
+                2 -> {
+                    val m = parts[0].toLong()
+                    val sParts = parts[1].split(".")
+                    val s = sParts[0].toLong()
+                    val ms = if (sParts.size > 1) sParts[1].padEnd(3, '0').take(3).toLong() else 0L
+                    m * 60_000L + s * 1_000L + ms
+                }
+                else -> null
+            }
+        } catch (_: NumberFormatException) {
+            null
+        }
+    }
+
+    private fun formatVttTimestamp(ms: Long): String {
+        val totalMs = ms.coerceAtLeast(0L)
+        val hours = totalMs / 3_600_000L
+        val minutes = (totalMs % 3_600_000L) / 60_000L
+        val seconds = (totalMs % 60_000L) / 1_000L
+        val millis = totalMs % 1_000L
+        return "%02d:%02d:%02d.%03d".format(hours, minutes, seconds, millis)
     }
 
     private fun parseAttributes(input: String): Map<String, String> {

@@ -1,6 +1,10 @@
 package com.nuvio.app.features.downloads
 
 import android.content.Context
+import android.media.MediaCodec
+import android.media.MediaExtractor
+import android.media.MediaFormat
+import android.media.MediaMuxer
 import android.net.Uri
 import androidx.documentfile.provider.DocumentFile
 import kotlinx.coroutines.CancellationException
@@ -18,9 +22,9 @@ import nuvio.composeapp.generated.resources.*
 import org.jetbrains.compose.resources.getString
 import java.io.File
 import java.io.FileOutputStream
-import java.io.InputStream
 import java.io.OutputStream
 import java.net.URI
+import java.nio.ByteBuffer
 import java.util.concurrent.TimeUnit
 
 private val downloadHttpClient = OkHttpClient.Builder()
@@ -280,10 +284,8 @@ internal actual object DownloadsPlatformDownloader {
         }
     }
 
-    actual fun downloadHlsSegments(
-        segmentUrls: List<String>,
-        sourceHeaders: Map<String, String>,
-        destinationFileName: String,
+    actual fun downloadAndRemuxHls(
+        request: HlsRemuxRequest,
         onProgress: (downloadedBytes: Long, totalBytes: Long?) -> Unit,
         onSuccess: (localFileUri: String, totalBytes: Long?) -> Unit,
         onFailure: (message: String) -> Unit,
@@ -302,85 +304,334 @@ internal actual object DownloadsPlatformDownloader {
             val customLocationUriString = DownloadsSettingsRepository.downloadLocationUri.value
             val customLocationUri = customLocationUriString?.let { Uri.parse(it) }
 
-            val destination: DownloadTarget
-            val tempFile: DownloadTarget
-
-            if (customLocationUri != null && customLocationUri.scheme == "content") {
-                val tree = DocumentFile.fromTreeUri(context, customLocationUri)
-                if (tree == null || !tree.canWrite()) {
-                    onFailure(runBlocking { getString(Res.string.downloads_error_cannot_write_location) })
-                    return@launch
-                }
-                destination = DocumentDownloadTarget(context, tree, destinationFileName)
-                tempFile = DocumentDownloadTarget(context, tree, "${destinationFileName}.hls.part")
-            } else {
-                val downloadsDir = File(context.filesDir, "downloads").apply { mkdirs() }
-                destination = FileDownloadTarget(File(downloadsDir, destinationFileName))
-                tempFile = FileDownloadTarget(File(downloadsDir, "${destinationFileName}.hls.part"))
-            }
-
-            var totalDownloaded = 0L
+            val workDir = File(context.cacheDir, "hls-remux-${request.destinationFileName}").apply { mkdirs() }
 
             try {
-                if (tempFile.exists()) tempFile.delete()
-                tempFile.openOutputStream(false).use { output ->
-                    for (segmentUrl in segmentUrls) {
-                        ensureActive()
+                val destination: DownloadTarget = if (customLocationUri != null && customLocationUri.scheme == "content") {
+                    val tree = DocumentFile.fromTreeUri(context, customLocationUri)
+                    if (tree == null || !tree.canWrite()) {
+                        error(runBlocking { getString(Res.string.downloads_error_cannot_write_location) })
+                    }
+                    DocumentDownloadTarget(context, tree, request.destinationFileName)
+                } else {
+                    val downloadsDir = File(context.filesDir, "downloads").apply { mkdirs() }
+                    FileDownloadTarget(File(downloadsDir, request.destinationFileName))
+                }
 
-                        val requestBuilder = Request.Builder().url(segmentUrl)
-                        sourceHeaders.forEach { (key, value) ->
-                            requestBuilder.header(key, value)
-                        }
+                // 1. Fetch + parse video playlist
+                val videoPlaylistContent = fetchUrlAsString(
+                    request.video.playlistUrl,
+                    request.sourceHeaders,
+                ) ?: error("Failed to fetch video playlist")
+                val videoPlaylist = HlsPlaylistParser.parseMediaPlaylist(
+                    videoPlaylistContent, request.video.playlistUrl,
+                )
+                if (videoPlaylist.segments.isEmpty()) error("Empty video playlist")
+                if (videoPlaylist.isEncrypted) {
+                    error(runBlocking { getString(Res.string.downloads_error_hls_encrypted) })
+                }
 
-                        val response = downloadHttpClient.newCall(requestBuilder.get().build()).execute()
-                        response.use { resp ->
-                            if (!resp.isSuccessful) {
-                                error(
-                                    runBlocking {
-                                        getString(Res.string.downloads_error_http_failed, resp.code)
-                                    },
-                                )
-                            }
+                // 2. Fetch + parse audio playlists
+                val audioPlaylists = request.audioTracks.map { track ->
+                    val content = fetchUrlAsString(track.playlistUrl, request.sourceHeaders)
+                        ?: error("Failed to fetch audio playlist: ${track.name}")
+                    val pl = HlsPlaylistParser.parseMediaPlaylist(content, track.playlistUrl)
+                    if (pl.segments.isEmpty()) error("Empty audio playlist: ${track.name}")
+                    if (pl.isEncrypted) error(runBlocking { getString(Res.string.downloads_error_hls_encrypted) })
+                    TrackPlaylist(track, pl)
+                }
 
-                            val body = resp.body ?: error(
-                                runBlocking { getString(Res.string.downloads_error_empty_body) },
-                            )
+                // 3. Fetch + parse subtitle playlists
+                val subtitlePlaylists = request.subtitleTracks.map { track ->
+                    val content = fetchUrlAsString(track.playlistUrl, request.sourceHeaders)
+                        ?: error("Failed to fetch subtitle playlist: ${track.name}")
+                    val pl = HlsPlaylistParser.parseMediaPlaylist(content, track.playlistUrl)
+                    if (pl.segments.isEmpty()) error("Empty subtitle playlist: ${track.name}")
+                    TrackPlaylist(track, pl)
+                }
 
-                            body.byteStream().use { input ->
-                                val buffer = ByteArray(16 * 1024)
-                                while (true) {
-                                    ensureActive()
-                                    val read = input.read(buffer)
-                                    if (read <= 0) break
-                                    output.write(buffer, 0, read)
-                                    totalDownloaded += read.toLong()
-                                    onProgress(totalDownloaded, null)
-                                }
-                                output.flush()
-                            }
+                // 4. Download all segments into temp .ts files (and .vtt for subtitles)
+                var totalDownloaded = 0L
+                val videoTsFile = File(workDir, "video.ts")
+                downloadSegmentsToTsFile(
+                    segmentUrls = videoPlaylist.segments.map { it.url },
+                    headers = request.sourceHeaders,
+                    outFile = videoTsFile,
+                    onChunk = { bytes ->
+                        totalDownloaded += bytes
+                        onProgress(totalDownloaded, null)
+                    },
+                    job = job,
+                )
+
+                val audioTsFiles = audioPlaylists.mapIndexed { index, tp ->
+                    val f = File(workDir, "audio_$index.ts")
+                    downloadSegmentsToTsFile(
+                        segmentUrls = tp.playlist.segments.map { it.url },
+                        headers = request.sourceHeaders,
+                        outFile = f,
+                        onChunk = { bytes ->
+                            totalDownloaded += bytes
+                            onProgress(totalDownloaded, null)
+                        },
+                        job = job,
+                    )
+                    f
+                }
+
+                val subtitleVttFiles = subtitlePlaylists.mapIndexed { index, tp ->
+                    val f = File(workDir, "subtitle_$index.vtt")
+                    downloadAndConcatVttSegments(
+                        segments = tp.playlist.segments,
+                        headers = request.sourceHeaders,
+                        outFile = f,
+                        onChunk = { bytes ->
+                            totalDownloaded += bytes
+                            onProgress(totalDownloaded, null)
+                        },
+                        job = job,
+                    )
+                    f
+                }
+
+                // 5. Remux video + audio into MP4 via MediaMuxer
+                val tempMp4 = File(workDir, "output.mp4")
+                remuxToMp4(
+                    videoTs = videoTsFile,
+                    audioTsFiles = audioTsFiles,
+                    audioTracks = audioPlaylists.map { it.track },
+                    outputMp4 = tempMp4,
+                )
+
+                // 6. Copy MP4 to destination
+                if (destination.exists()) destination.delete()
+                tempMp4.inputStream().use { input ->
+                    destination.openOutputStream(false).use { output ->
+                        input.copyTo(output)
+                    }
+                }
+
+                // 7. Copy subtitle sidecar files (.vtt) next to the MP4
+                // Android MediaMuxer does not support mov_text subtitle tracks in MP4 output,
+                // so subtitles are saved as sidecar WebVTT files. ExoPlayer auto-loads them
+                // when they share the same base filename (e.g. "movie.mp4" + "movie.it.vtt").
+                val baseName = request.destinationFileName.substringBeforeLast('.')
+                subtitlePlaylists.forEachIndexed { index, tp ->
+                    val lang = tp.track.language?.takeIf { it.isNotBlank() }
+                        ?.sanitizeFileNameForSidecar()
+                        ?: (index + 1).toString()
+                    val sidecarName = "${baseName}.$lang.vtt"
+                    val sidecarTarget = if (customLocationUri != null && customLocationUri.scheme == "content") {
+                        val tree = DocumentFile.fromTreeUri(context, customLocationUri)
+                            ?: return@forEachIndexed
+                        DocumentDownloadTarget(context, tree, sidecarName)
+                    } else {
+                        val downloadsDir = File(context.filesDir, "downloads")
+                        FileDownloadTarget(File(downloadsDir, sidecarName))
+                    }
+                    if (sidecarTarget.exists()) sidecarTarget.delete()
+                    subtitleVttFiles[index].inputStream().use { input ->
+                        sidecarTarget.openOutputStream(false).use { output ->
+                            input.copyTo(output)
                         }
                     }
                 }
 
-                if (destination.exists()) destination.delete()
-                if (!tempFile.renameTo(destination)) {
-                    tempFile.copyTo(destination)
-                    tempFile.delete()
-                }
+                // 8. Cleanup temp dir
+                workDir.deleteRecursively()
 
                 val finalSize = destination.length()
                 onSuccess(destination.toUriString(), finalSize)
             } catch (error: Throwable) {
+                if (error is CancellationException) throw error
+                runCatching { workDir.deleteRecursively() }
                 onFailure(error.message ?: runBlocking { getString(Res.string.download_failed) })
             }
         }
 
-        job.invokeOnCompletion {
-            // cleanup handled by the coroutine
-        }
-
         return AndroidDownloadsTaskHandle(job)
     }
+
+    private data class TrackPlaylist(
+        val track: HlsRemuxTrack,
+        val playlist: HlsMediaPlaylist,
+    )
+
+    private fun downloadSegmentsToTsFile(
+        segmentUrls: List<String>,
+        headers: Map<String, String>,
+        outFile: File,
+        onChunk: (bytesDelta: Long) -> Unit,
+        job: Job,
+    ) {
+        outFile.outputStream().use { output ->
+            for (segmentUrl in segmentUrls) {
+                job.ensureActive()
+                val requestBuilder = Request.Builder().url(segmentUrl)
+                headers.forEach { (k, v) -> requestBuilder.header(k, v) }
+                val response = downloadHttpClient.newCall(requestBuilder.get().build()).execute()
+                response.use { resp ->
+                    if (!resp.isSuccessful) {
+                        error(runBlocking { getString(Res.string.downloads_error_http_failed, resp.code) })
+                    }
+                    val body = resp.body ?: error(
+                        runBlocking { getString(Res.string.downloads_error_empty_body) },
+                    )
+                    body.byteStream().use { input ->
+                        val buffer = ByteArray(16 * 1024)
+                        while (true) {
+                            job.ensureActive()
+                            val read = input.read(buffer)
+                            if (read <= 0) break
+                            output.write(buffer, 0, read)
+                            onChunk(read.toLong())
+                        }
+                    }
+                }
+            }
+            output.flush()
+        }
+    }
+
+    private fun downloadAndConcatVttSegments(
+        segments: List<HlsSegment>,
+        headers: Map<String, String>,
+        outFile: File,
+        onChunk: (bytesDelta: Long) -> Unit,
+        job: Job,
+    ) {
+        val segmentContents = mutableListOf<String>()
+        val segmentDurations = mutableListOf<Double>()
+
+        for (segment in segments) {
+            job.ensureActive()
+            val requestBuilder = Request.Builder().url(segment.url)
+            headers.forEach { (k, v) -> requestBuilder.header(k, v) }
+            val response = downloadHttpClient.newCall(requestBuilder.get().build()).execute()
+            response.use { resp ->
+                if (!resp.isSuccessful) {
+                    error(runBlocking { getString(Res.string.downloads_error_http_failed, resp.code) })
+                }
+                val body = resp.body ?: error(
+                    runBlocking { getString(Res.string.downloads_error_empty_body) },
+                )
+                val text = body.string()
+                segmentContents.add(text)
+                segmentDurations.add(segment.duration)
+                onChunk(text.length.toLong())
+            }
+        }
+
+        val merged = HlsPlaylistParser.concatWebVttSegments(segmentContents, segmentDurations)
+        outFile.writeText(merged)
+    }
+
+    private fun remuxToMp4(
+        videoTs: File,
+        audioTsFiles: List<File>,
+        audioTracks: List<HlsRemuxTrack>,
+        outputMp4: File,
+    ) {
+        val videoExtractor = MediaExtractor()
+        videoExtractor.setDataSource(videoTs.absolutePath)
+
+        var videoTrackIndex = -1
+        for (i in 0 until videoExtractor.trackCount) {
+            val format = videoExtractor.getTrackFormat(i)
+            val mime = format.getString(MediaFormat.KEY_MIME) ?: continue
+            if (mime.startsWith("video/")) {
+                videoTrackIndex = i
+                videoExtractor.selectTrack(i)
+                break
+            }
+        }
+        if (videoTrackIndex == -1) {
+            videoExtractor.release()
+            error("No video track found in video playlist")
+        }
+
+        val audioExtractors = mutableListOf<MediaExtractor>()
+        val audioTrackIndices = mutableListOf<Int>()
+        try {
+            for (audioTs in audioTsFiles) {
+                val ext = MediaExtractor()
+                ext.setDataSource(audioTs.absolutePath)
+                var foundIdx = -1
+                for (i in 0 until ext.trackCount) {
+                    val format = ext.getTrackFormat(i)
+                    val mime = format.getString(MediaFormat.KEY_MIME) ?: continue
+                    if (mime.startsWith("audio/")) {
+                        foundIdx = i
+                        ext.selectTrack(i)
+                        break
+                    }
+                }
+                if (foundIdx == -1) {
+                    ext.release()
+                    error("No audio track found in ${audioTs.name}")
+                }
+                audioExtractors.add(ext)
+                audioTrackIndices.add(foundIdx)
+            }
+
+            val muxer = MediaMuxer(
+                outputMp4.absolutePath,
+                MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4,
+            )
+
+            val videoOutTrack = muxer.addTrack(videoExtractor.getTrackFormat(videoTrackIndex))
+            val audioOutTracks = audioExtractors.mapIndexed { idx, ext ->
+                val format = ext.getTrackFormat(audioTrackIndices[idx])
+                audioTracks.getOrNull(idx)?.language?.takeIf { it.isNotBlank() }?.let { lang ->
+                    format.setString(MediaFormat.KEY_LANGUAGE, lang)
+                }
+                muxer.addTrack(format)
+            }
+
+            muxer.start()
+
+            val buffer = ByteBuffer.allocateDirect(2 * 1024 * 1024)
+            val bufferInfo = MediaCodec.BufferInfo()
+
+            // Video samples
+            while (true) {
+                buffer.clear()
+                val size = videoExtractor.readSampleData(buffer, 0)
+                if (size < 0) break
+                bufferInfo.offset = 0
+                bufferInfo.size = size
+                bufferInfo.flags = videoExtractor.sampleFlags
+                bufferInfo.presentationTimeUs = videoExtractor.sampleTime
+                muxer.writeSampleData(videoOutTrack, buffer, bufferInfo)
+                videoExtractor.advance()
+            }
+
+            // Audio samples (each track sequentially)
+            audioExtractors.forEachIndexed { idx, ext ->
+                val outTrack = audioOutTracks[idx]
+                while (true) {
+                    buffer.clear()
+                    val size = ext.readSampleData(buffer, 0)
+                    if (size < 0) break
+                    bufferInfo.offset = 0
+                    bufferInfo.size = size
+                    bufferInfo.flags = ext.sampleFlags
+                    bufferInfo.presentationTimeUs = ext.sampleTime
+                    muxer.writeSampleData(outTrack, buffer, bufferInfo)
+                    ext.advance()
+                }
+            }
+
+            muxer.stop()
+            muxer.release()
+        } finally {
+            videoExtractor.release()
+            audioExtractors.forEach { runCatching { it.release() } }
+        }
+    }
+
+    private fun String.sanitizeFileNameForSidecar(): String =
+        trim().lowercase().replace(Regex("[^a-z0-9_-]"), "_")
 }
 
 private class AndroidDownloadsTaskHandle(
