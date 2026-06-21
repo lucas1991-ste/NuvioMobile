@@ -1599,6 +1599,7 @@
     <string name="downloads_hls_subtitle_hint">Tap to toggle. Choose which subtitle languages to embed.</string>
     <string name="downloads_hls_no_audio">Audio is embedded in the video stream (no separate language tracks).</string>
     <string name="downloads_hls_no_subtitles">No subtitles available</string>
+    <string name="downloads_hls_embedded">Embedded</string>
     <string name="downloads_error_hls_encrypted">Cannot download: stream is encrypted with an unsupported method</string>
     <string name="downloads_error_hls_drm">Cannot download: stream uses a proprietary DRM system (FairPlay / Widevine / PlayReady)</string>
     <string name="downloads_error_ffmpeg_missing">ffmpeg not found. Install ffmpeg and try again.</string>

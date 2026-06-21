@@ -596,22 +596,28 @@ object DownloadsRepository {
                     language = null,
                     kind = HlsRemuxTrackKind.VIDEO,
                 ),
-                audioTracks = item.hlsAudioTracks.mapIndexed { index, track ->
-                    HlsRemuxTrack(
-                        playlistUrl = track.url,
-                        name = track.name.ifBlank { "Audio ${index + 1}" },
-                        language = track.language,
-                        kind = HlsRemuxTrackKind.AUDIO,
-                    )
-                },
-                subtitleTracks = item.hlsSubtitleTracks.mapIndexed { index, track ->
-                    HlsRemuxTrack(
-                        playlistUrl = track.url,
-                        name = track.name.ifBlank { "Subtitles ${index + 1}" },
-                        language = track.language,
-                        kind = HlsRemuxTrackKind.SUBTITLE,
-                    )
-                },
+                // Filter out embedded tracks (empty URL) — they have no separate
+                // playlist and are already multiplexed inside the video stream.
+                audioTracks = item.hlsAudioTracks
+                    .filter { it.url.isNotBlank() }
+                    .mapIndexed { index, track ->
+                        HlsRemuxTrack(
+                            playlistUrl = track.url,
+                            name = track.name.ifBlank { "Audio ${index + 1}" },
+                            language = track.language,
+                            kind = HlsRemuxTrackKind.AUDIO,
+                        )
+                    },
+                subtitleTracks = item.hlsSubtitleTracks
+                    .filter { it.url.isNotBlank() }
+                    .mapIndexed { index, track ->
+                        HlsRemuxTrack(
+                            playlistUrl = track.url,
+                            name = track.name.ifBlank { "Subtitles ${index + 1}" },
+                            language = track.language,
+                            kind = HlsRemuxTrackKind.SUBTITLE,
+                        )
+                    },
                 sourceHeaders = item.sourceHeaders,
                 destinationFileName = item.fileName,
             )

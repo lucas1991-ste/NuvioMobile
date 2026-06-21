@@ -333,24 +333,33 @@ internal actual object DownloadsPlatformDownloader {
                 validateEncryption(videoPlaylist.encryption)
 
                 // 2. Fetch + parse audio playlists
-                val audioPlaylists = request.audioTracks.map { track ->
-                    val content = fetchUrlAsString(track.playlistUrl, request.sourceHeaders)
-                        ?: error("Failed to fetch audio playlist: ${track.name}")
-                    val pl = HlsPlaylistParser.parseMediaPlaylist(content, track.playlistUrl)
-                    if (pl.segments.isEmpty()) error("Empty audio playlist: ${track.name}")
-                    validateEncryption(pl.encryption)
-                    TrackPlaylist(track, pl)
-                }
+                // Skip tracks with an empty playlist URL — they are embedded in the
+                // video stream (no separate playlist to fetch). MediaExtractor will
+                // harvest the embedded audio automatically during remux.
+                val audioPlaylists = request.audioTracks
+                    .filter { it.playlistUrl.isNotBlank() }
+                    .map { track ->
+                        val content = fetchUrlAsString(track.playlistUrl, request.sourceHeaders)
+                            ?: error("Failed to fetch audio playlist: ${track.name}")
+                        val pl = HlsPlaylistParser.parseMediaPlaylist(content, track.playlistUrl)
+                        if (pl.segments.isEmpty()) error("Empty audio playlist: ${track.name}")
+                        validateEncryption(pl.encryption)
+                        TrackPlaylist(track, pl)
+                    }
 
                 // 3. Fetch + parse subtitle playlists
-                val subtitlePlaylists = request.subtitleTracks.map { track ->
-                    val content = fetchUrlAsString(track.playlistUrl, request.sourceHeaders)
-                        ?: error("Failed to fetch subtitle playlist: ${track.name}")
-                    val pl = HlsPlaylistParser.parseMediaPlaylist(content, track.playlistUrl)
-                    if (pl.segments.isEmpty()) error("Empty subtitle playlist: ${track.name}")
-                    validateEncryption(pl.encryption)
-                    TrackPlaylist(track, pl)
-                }
+                // Skip tracks with an empty playlist URL — they are embedded in the
+                // video stream and cannot be downloaded as a separate file.
+                val subtitlePlaylists = request.subtitleTracks
+                    .filter { it.playlistUrl.isNotBlank() }
+                    .map { track ->
+                        val content = fetchUrlAsString(track.playlistUrl, request.sourceHeaders)
+                            ?: error("Failed to fetch subtitle playlist: ${track.name}")
+                        val pl = HlsPlaylistParser.parseMediaPlaylist(content, track.playlistUrl)
+                        if (pl.segments.isEmpty()) error("Empty subtitle playlist: ${track.name}")
+                        validateEncryption(pl.encryption)
+                        TrackPlaylist(track, pl)
+                    }
 
                 // 4. Download all segments into temp .ts files (and .vtt for subtitles)
                 var totalDownloaded = 0L

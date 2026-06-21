@@ -1650,6 +1650,7 @@
 <string name="downloads_hls_subtitle_hint">Tocca per attivare/disattivare. Scegli quali lingue dei sottotitoli incorporare.</string>
 <string name="downloads_hls_no_audio">L\'audio è incorporato nello stream video (nessuna traccia audio separata).</string>
 <string name="downloads_hls_no_subtitles">Nessun sottotitolo disponibile</string>
+<string name="downloads_hls_embedded">Incorporato</string>
 <string name="downloads_error_hls_encrypted">Impossibile scaricare: stream cifrato con metodo non supportato</string>
 <string name="downloads_error_hls_drm">Impossibile scaricare: lo stream utilizza un DRM proprierario (FairPlay / Widevine / PlayReady)</string>
 <string name="downloads_error_ffmpeg_missing">ffmpeg non trovato. Installa ffmpeg e riprova.</string>

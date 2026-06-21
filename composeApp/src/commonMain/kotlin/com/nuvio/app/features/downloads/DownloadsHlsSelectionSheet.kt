@@ -48,6 +48,7 @@ import nuvio.composeapp.generated.resources.download_failed
 import nuvio.composeapp.generated.resources.downloads_hls_audio
 import nuvio.composeapp.generated.resources.downloads_hls_audio_hint
 import nuvio.composeapp.generated.resources.downloads_hls_download
+import nuvio.composeapp.generated.resources.downloads_hls_embedded
 import nuvio.composeapp.generated.resources.downloads_hls_fetching
 import nuvio.composeapp.generated.resources.downloads_hls_no_audio
 import nuvio.composeapp.generated.resources.downloads_hls_no_subtitles
@@ -111,13 +112,32 @@ fun DownloadsHlsSelectionSheet(
     // Audio tracks: multi-select. Default = the track flagged DEFAULT in the master playlist.
     // Selection state is keyed by track index, not by URI, because multiple tracks may share
     // the same (or empty) URI and would otherwise collapse into a single toggle.
+    // Tracks without a URI are "embedded" (multiplexed inside the video stream) and cannot
+    // be downloaded separately — they are shown but their checkbox is disabled.
     val audioTracks = remember(playlist) { playlist?.audioTracks.orEmpty() }
+    val embeddedAudioIndices = remember(audioTracks) {
+        audioTracks.mapIndexedNotNull { index, track ->
+            if (track.uri.isNullOrBlank()) index else null
+        }.toSet()
+    }
     var selectedAudioIndices by remember(audioTracks) {
-        mutableStateOf(audioTracks.mapIndexed { index, track -> index }.filter { audioTracks[it].isDefault }.toSet())
+        mutableStateOf(
+            audioTracks
+                .mapIndexed { index, track -> index to track }
+                .filter { (index, track) -> track.isDefault && index !in embeddedAudioIndices }
+                .map { it.first }
+                .toSet(),
+        )
     }
 
     // Subtitle tracks: multi-select. Default = empty (no subtitles).
+    // Tracks without a URI are "embedded" and cannot be downloaded separately.
     val subtitleTracks = remember(playlist) { playlist?.subtitleTracks.orEmpty() }
+    val embeddedSubtitleIndices = remember(subtitleTracks) {
+        subtitleTracks.mapIndexedNotNull { index, track ->
+            if (track.uri.isNullOrBlank()) index else null
+        }.toSet()
+    }
     var selectedSubtitleIndices by remember(subtitleTracks) {
         mutableStateOf(emptySet<Int>())
     }
@@ -245,16 +265,21 @@ fun DownloadsHlsSelectionSheet(
                                 verticalArrangement = Arrangement.spacedBy(2.dp),
                             ) {
                                 audioTracks.forEachIndexed { index, track ->
+                                    val isEmbedded = index in embeddedAudioIndices
                                     val isSelected = index in selectedAudioIndices
                                     SelectableTrackRow(
                                         name = track.name,
                                         language = track.language,
+                                        isEmbedded = isEmbedded,
                                         isSelected = isSelected,
+                                        enabled = !isEmbedded,
                                         onToggle = {
-                                            selectedAudioIndices = if (isSelected) {
-                                                selectedAudioIndices - index
-                                            } else {
-                                                selectedAudioIndices + index
+                                            if (!isEmbedded) {
+                                                selectedAudioIndices = if (isSelected) {
+                                                    selectedAudioIndices - index
+                                                } else {
+                                                    selectedAudioIndices + index
+                                                }
                                             }
                                         },
                                     )
@@ -289,16 +314,21 @@ fun DownloadsHlsSelectionSheet(
                                 verticalArrangement = Arrangement.spacedBy(2.dp),
                             ) {
                                 subtitleTracks.forEachIndexed { index, track ->
+                                    val isEmbedded = index in embeddedSubtitleIndices
                                     val isSelected = index in selectedSubtitleIndices
                                     SelectableTrackRow(
                                         name = track.name,
                                         language = track.language,
+                                        isEmbedded = isEmbedded,
                                         isSelected = isSelected,
+                                        enabled = !isEmbedded,
                                         onToggle = {
-                                            selectedSubtitleIndices = if (isSelected) {
-                                                selectedSubtitleIndices - index
-                                            } else {
-                                                selectedSubtitleIndices + index
+                                            if (!isEmbedded) {
+                                                selectedSubtitleIndices = if (isSelected) {
+                                                    selectedSubtitleIndices - index
+                                                } else {
+                                                    selectedSubtitleIndices + index
+                                                }
                                             }
                                         },
                                     )
@@ -323,7 +353,9 @@ fun DownloadsHlsSelectionSheet(
                                 }
                                 val audioSelections = audioTracks
                                     .mapIndexed { index, track -> index to track }
-                                    .filter { (index, _) -> index in selectedAudioIndices }
+                                    .filter { (index, track) ->
+                                        index in selectedAudioIndices && track.uri.isNullOrBlank().not()
+                                    }
                                     .map { (_, track) ->
                                         HlsTrackSelection(
                                             url = track.uri.orEmpty(),
@@ -333,7 +365,9 @@ fun DownloadsHlsSelectionSheet(
                                     }
                                 val subtitleSelections = subtitleTracks
                                     .mapIndexed { index, track -> index to track }
-                                    .filter { (index, _) -> index in selectedSubtitleIndices }
+                                    .filter { (index, track) ->
+                                        index in selectedSubtitleIndices && track.uri.isNullOrBlank().not()
+                                    }
                                     .map { (_, track) ->
                                         HlsTrackSelection(
                                             url = track.uri.orEmpty(),
@@ -368,16 +402,25 @@ fun DownloadsHlsSelectionSheet(
 private fun SelectableTrackRow(
     name: String,
     language: String?,
+    isEmbedded: Boolean,
     isSelected: Boolean,
+    enabled: Boolean,
     onToggle: () -> Unit,
 ) {
+    val embeddedLabel = stringResource(Res.string.downloads_hls_embedded)
+    val displayName = if (isEmbedded) "$name ($embeddedLabel)" else name
+
     Surface(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(onClick = onToggle),
+            .then(
+                if (enabled) Modifier.clickable(onClick = onToggle) else Modifier,
+            ),
         shape = RoundedCornerShape(8.dp),
-        color = if (isSelected) {
+        color = if (isSelected && enabled) {
             MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.4f)
+        } else if (isEmbedded) {
+            MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.15f)
         } else {
             MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f)
         },
@@ -391,14 +434,19 @@ private fun SelectableTrackRow(
         ) {
             Checkbox(
                 checked = isSelected,
-                onCheckedChange = { onToggle() },
+                onCheckedChange = if (enabled) { { onToggle() } } else null,
+                enabled = enabled,
                 modifier = Modifier.size(24.dp),
             )
             Column {
                 Text(
-                    text = name,
+                    text = displayName,
                     style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurface,
+                    color = if (enabled) {
+                        MaterialTheme.colorScheme.onSurface
+                    } else {
+                        MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f)
+                    },
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
@@ -406,7 +454,11 @@ private fun SelectableTrackRow(
                     Text(
                         text = lang,
                         style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        color = if (enabled) {
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                        } else {
+                            MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)
+                        },
                     )
                 }
             }
