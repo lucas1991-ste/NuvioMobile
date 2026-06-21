@@ -444,6 +444,7 @@ internal actual object DownloadsPlatformDownloader {
                     audioTsFiles = audioTsFiles,
                     audioTracks = audioPlaylists.map { it.track },
                     outputMp4 = tempMp4,
+                    videoInitSegmentPresent = videoInitFile != null,
                 )
 
                 // 7. Copy MP4 to destination
@@ -629,6 +630,34 @@ internal actual object DownloadsPlatformDownloader {
                     // long segments a streaming approach would be needed.
                     val ciphertext = body.bytes()
                     onChunk(ciphertext.size.toLong())
+
+                    // === Content validation ===
+                    // Some CDNs (e.g. StreamingCommunity's edge) return HTTP 200
+                    // with an HTML body (token-expired / paywall / error page)
+                    // when the request is missing required headers or the signed
+                    // URL has expired. Sniffing the first bytes prevents that
+                    // HTML from being concatenated into the .ts file, which
+                    // would later cause "Failed to instantiate extractor".
+                    val sniff = HlsPlaylistParser.sniffSegmentFormat(ciphertext)
+                    if (sniff == "html") {
+                        val preview = runCatching {
+                            String(ciphertext, 0, minOf(256, ciphertext.size), Charsets.UTF_8)
+                        }.getOrDefault("")
+                        error(
+                            "Server returned an HTML page instead of segment data for $segmentUrl " +
+                                "(likely expired token or missing headers). Preview: " +
+                                preview.replace('\n', ' ').replace('\r', ' ').take(200),
+                        )
+                    }
+                    // For the very first segment, also log a warning if format
+                    // is unknown — it may still be a valid encrypted blob (AES-128
+                    // ciphertext is indistinguishable from random bytes), so we
+                    // don't hard-fail here; the remux step will catch real issues.
+                    if (index == 0 && sniff == "unknown" && aesKey == null) {
+                        // Soft signal: append a marker to the file name? No —
+                        // we surface the issue at remux time with a clear error.
+                    }
+
                     val plaintext = if (aesKey != null && encryption != null) {
                         val iv = encryption.iv ?: HlsPlaylistParser.deriveIvFromSequence(
                             mediaSequenceStart + index,
@@ -682,9 +711,64 @@ internal actual object DownloadsPlatformDownloader {
         audioTsFiles: List<File>,
         audioTracks: List<HlsRemuxTrack>,
         outputMp4: File,
+        videoInitSegmentPresent: Boolean = false,
     ) {
+        // === Pre-flight validation ===
+        // Catch the most common root causes of "Failed to instantiate extractor"
+        // BEFORE calling MediaExtractor.setDataSource, so the error message
+        // tells the user (and us) what actually went wrong instead of the
+        // generic platform exception.
+        if (!videoTs.exists() || videoTs.length() < 1024) {
+            error(
+                "Video segment file is missing or too small: " +
+                    "${videoTs.absolutePath} (${videoTs.length()} bytes). " +
+                    "The download likely failed mid-stream (network reset, CDN 200-OK-with-HTML, ...).",
+            )
+        }
+
+        val videoSniff = sniffFileFormat(videoTs)
+        when (videoSniff) {
+            "html" -> error(
+                "Video segment file appears to be HTML, not media data. " +
+                    "The CDN returned an error page (token expired / paywall) with HTTP 200. " +
+                    "First 200 bytes: " + peekFileText(videoTs, 200),
+            )
+            "fmp4" -> {
+                if (!videoInitSegmentPresent) {
+                    error(
+                        "Video segments are fragmented MP4 (CMAF) but no #EXT-X-MAP init segment " +
+                            "was found in the playlist. Without the ftyp+moov boxes MediaExtractor " +
+                            "cannot parse the segments. This usually means the master playlist " +
+                            "you selected is a sub-master that does not directly contain #EXT-X-MAP, " +
+                            "or the playlist was served with a non-standard EXT-X-MAP format. " +
+                            "Try a different quality variant.",
+                    )
+                }
+                // fMP4 with init segment already prepended at step 5 — should be parseable.
+            }
+            "ts" -> {
+                // MPEG-TS is self-describing; MediaExtractor handles it natively.
+            }
+            "unknown" -> {
+                // Could be encrypted blob already decrypted, or genuinely unknown.
+                // Don't hard-fail here; let MediaExtractor try and produce its own
+                // error, which we'll wrap below with context.
+            }
+        }
+
         val videoExtractor = MediaExtractor()
-        videoExtractor.setDataSource(videoTs.absolutePath)
+        try {
+            videoExtractor.setDataSource(videoTs.absolutePath)
+        } catch (e: Exception) {
+            videoExtractor.release()
+            error(
+                "MediaExtractor failed to instantiate extractor on ${videoTs.name} " +
+                    "(size=${videoTs.length()} bytes, format=$videoSniff, " +
+                    "initSegment=$videoInitSegmentPresent). " +
+                    "Root cause: ${e.javaClass.simpleName}: ${e.message}. " +
+                    "First 32 bytes (hex): " + peekFileHex(videoTs, 32),
+            )
+        }
 
         var videoTrackIndex = -1
         // When the master playlist has no separate audio variants, the audio
@@ -710,15 +794,41 @@ internal actual object DownloadsPlatformDownloader {
         }
         if (videoTrackIndex == -1) {
             videoExtractor.release()
-            error("No video track found in video playlist")
+            error(
+                "No video track found in ${videoTs.name} " +
+                    "(tracks=${videoExtractor.trackCount}, format=$videoSniff). " +
+                    "The file may have been corrupted during download.",
+            )
         }
 
         val audioExtractors = mutableListOf<MediaExtractor>()
         val audioTrackIndices = mutableListOf<Int>()
         try {
             for (audioTs in audioTsFiles) {
+                // Same pre-flight check for audio files.
+                if (!audioTs.exists() || audioTs.length() < 1024) {
+                    error("Audio segment file is missing or too small: ${audioTs.name} (${audioTs.length()} bytes)")
+                }
+                val audioSniff = sniffFileFormat(audioTs)
+                if (audioSniff == "html") {
+                    error(
+                        "Audio segment file ${audioTs.name} appears to be HTML, not media data. " +
+                            "First 200 bytes: " + peekFileText(audioTs, 200),
+                    )
+                }
+
                 val ext = MediaExtractor()
-                ext.setDataSource(audioTs.absolutePath)
+                try {
+                    ext.setDataSource(audioTs.absolutePath)
+                } catch (e: Exception) {
+                    ext.release()
+                    error(
+                        "MediaExtractor failed on ${audioTs.name} " +
+                            "(size=${audioTs.length()} bytes, format=$audioSniff). " +
+                            "Root cause: ${e.javaClass.simpleName}: ${e.message}. " +
+                            "First 32 bytes (hex): " + peekFileHex(audioTs, 32),
+                    )
+                }
                 var foundIdx = -1
                 for (i in 0 until ext.trackCount) {
                     val format = ext.getTrackFormat(i)
@@ -731,7 +841,7 @@ internal actual object DownloadsPlatformDownloader {
                 }
                 if (foundIdx == -1) {
                     ext.release()
-                    error("No audio track found in ${audioTs.name}")
+                    error("No audio track found in ${audioTs.name} (tracks=${ext.trackCount}, format=$audioSniff)")
                 }
                 audioExtractors.add(ext)
                 audioTrackIndices.add(foundIdx)
@@ -816,7 +926,62 @@ internal actual object DownloadsPlatformDownloader {
 
     private fun String.sanitizeFileNameForSidecar(): String =
         trim().lowercase().replace(Regex("[^a-z0-9_-]"), "_")
+
+    /**
+     * Sniff the format of a downloaded segment file by reading its first 256 bytes
+     * and delegating to [HlsPlaylistParser.sniffSegmentFormat].
+     */
+    private fun sniffFileFormat(file: File): String {
+        if (!file.exists() || file.length() == 0L) return "unknown"
+        return try {
+            file.inputStream().use { input ->
+                val header = ByteArray(256)
+                val read = input.read(header)
+                if (read <= 0) return "unknown"
+                HlsPlaylistParser.sniffSegmentFormat(
+                    if (read == header.size) header else header.copyOf(read),
+                )
+            }
+        } catch (_: Exception) {
+            "unknown"
+        }
+    }
+
+    /** Read the first [maxBytes] of [file] as UTF-8 text, for error messages. */
+    private fun peekFileText(file: File, maxBytes: Int): String {
+        return try {
+            file.inputStream().use { input ->
+                val buf = ByteArray(maxBytes.coerceAtLeast(1))
+                val read = input.read(buf)
+                if (read <= 0) "" else String(buf, 0, read, Charsets.UTF_8)
+            }
+        } catch (_: Exception) {
+            ""
+        }.replace('\n', ' ').replace('\r', ' ').replace('\t', ' ')
+    }
+
+    /** Read the first [maxBytes] of [file] and return them as a hex string, for error messages. */
+    private fun peekFileHex(file: File, maxBytes: Int): String {
+        return try {
+            file.inputStream().use { input ->
+                val buf = ByteArray(maxBytes.coerceAtLeast(1))
+                val read = input.read(buf)
+                if (read <= 0) return@use ""
+                StringBuilder(read * 2).also { sb ->
+                    for (i in 0 until read) {
+                        val v = buf[i].toInt() and 0xFF
+                        sb.append(HEX_DIGITS[v ushr 4])
+                        sb.append(HEX_DIGITS[v and 0x0F])
+                    }
+                }.toString()
+            }
+        } catch (_: Exception) {
+            ""
+        }
+    }
 }
+
+private val HEX_DIGITS = "0123456789ABCDEF".toCharArray()
 
 private class AndroidDownloadsTaskHandle(
     private val job: Job,

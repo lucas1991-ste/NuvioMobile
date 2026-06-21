@@ -126,6 +126,74 @@ object HlsPlaylistParser {
             lower.contains("/chunklist/")
     }
 
+    /**
+     * Sniff the format of an HLS media segment by looking at its first bytes.
+     *
+     * Returns one of:
+     *   - "ts"     -> MPEG-TS (sync byte 0x47 at offset 0, repeated every 188 bytes)
+     *   - "fmp4"   -> fragmented MP4 / CMAF (ISO BMFF box at offset 0: "styp", "moof", "mdat", "ftyp", "moov", "emsg", "sidx")
+     *   - "html"   -> looks like an HTML page (server returned an error/wall)
+     *   - "unknown"-> cannot determine
+     *
+     * Used by the remux layer to validate that what was downloaded is actually
+     * media data (and not, say, an HTML paywall) and to detect fMP4 segments
+     * that were downloaded without their #EXT-X-MAP init segment.
+     *
+     * Public and platform-agnostic so both Android (MediaExtractor) and Desktop
+     * (ffmpeg) can share the same sniffing logic.
+     */
+    fun sniffSegmentFormat(headerBytes: ByteArray): String {
+        if (headerBytes.size < 4) return "unknown"
+
+        // === MPEG-TS detection ===
+        // Sync byte 0x47 at offset 0, and again at offset 188 (and 376, ...).
+        if (headerBytes[0] == 0x47.toByte()) {
+            if (headerBytes.size >= 189 && headerBytes[188] == 0x47.toByte()) return "ts"
+            // Some init segments or pure-TS files: just one sync byte is a strong hint
+            // when followed by well-formed TS payload start.
+            return "ts"
+        }
+
+        // === HTML detection (server returned an error/wall as 200 OK) ===
+        // Typical signatures: "<!DOCTYPE", "<html", "<?xml", "<HTML"
+        if (headerBytes.size >= 5) {
+            val asText = runCatching {
+                String(headerBytes, 0, minOf(64, headerBytes.size), Charsets.US_ASCII)
+            }.getOrDefault("")
+            val trimmed = asText.trimStart()
+            val lower = trimmed.lowercase()
+            if (lower.startsWith("<!doctype") ||
+                lower.startsWith("<html") ||
+                lower.startsWith("<?xml") ||
+                lower.startsWith("<head")
+            ) {
+                return "html"
+            }
+        }
+
+        // === fMP4 / CMAF detection (ISO BMFF) ===
+        // Box layout: [4 bytes size][4 bytes type][payload...]
+        // Common first boxes for HLS fMP4 segments: styp, moof, mdat, ftyp, moov, emsg, sidx
+        if (headerBytes.size >= 8) {
+            val boxType = runCatching {
+                String(headerBytes, 4, 4, Charsets.US_ASCII)
+            }.getOrDefault("")
+            if (boxType in setOf("styp", "moof", "mdat", "ftyp", "moov", "emsg", "sidx", "free", "skip")) {
+                return "fmp4"
+            }
+        }
+
+        return "unknown"
+    }
+
+    /**
+     * Convenience overload: sniff a segment format from the first [bytesToRead]
+     * bytes of an [inputStream]. Closes nothing; the caller owns the stream.
+     *
+     * Implemented in commonMain via [sniffSegmentFormat] (ByteArray).
+     */
+    // (overloads with InputStream live on platform sides, where java.io is available)
+
     fun isHlsStream(streamType: String?): Boolean =
         streamType?.trim().equals("hls", ignoreCase = true)
 
@@ -137,7 +205,7 @@ object HlsPlaylistParser {
     }
 
     fun parseMasterPlaylist(content: String, baseUrl: String): HlsMasterPlaylist {
-        val lines = content.lines()
+        val lines = stripBom(content).lines()
         val variants = mutableListOf<HlsVariant>()
         val audioTracks = mutableListOf<HlsMediaTrack>()
         val subtitleTracks = mutableListOf<HlsMediaTrack>()
@@ -189,7 +257,7 @@ object HlsPlaylistParser {
     }
 
     fun parseMediaPlaylist(content: String, baseUrl: String): HlsMediaPlaylist {
-        val lines = content.lines()
+        val lines = stripBom(content).lines()
         val segments = mutableListOf<HlsSegment>()
         var targetDuration = 0.0
         var currentDuration = 0.0
@@ -507,6 +575,18 @@ object HlsPlaylistParser {
 
     private fun removeQuotes(value: String): String =
         value.trim().removeSurrounding("\"")
+
+    /**
+     * Strip a leading UTF-8 BOM (EF BB BF) if present. Some HTTP servers and
+     * CDNs emit HLS playlists with a BOM, which would otherwise break the
+     * detection of the first directive (#EXTM3U or #EXT-X-VERSION).
+     */
+    private fun stripBom(content: String): String {
+        if (content.isEmpty()) return content
+        // BOM as it appears at the start of a Kotlin String read from UTF-8 bytes
+        if (content.startsWith("\uFEFF")) return content.removePrefix("\uFEFF")
+        return content
+    }
 
     /**
      * Resolve a possibly-relative HLS URI against a base URL.

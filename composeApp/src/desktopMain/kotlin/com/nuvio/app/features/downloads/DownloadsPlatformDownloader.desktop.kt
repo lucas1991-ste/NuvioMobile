@@ -228,6 +228,42 @@ internal actual object DownloadsPlatformDownloader {
                 combinedVideo.renameTo(videoTs)
             }
 
+            // === Pre-flight validation before invoking ffmpeg ===
+            // Catch the most common root causes of ffmpeg's generic
+            // "Invalid data found when processing input" so the user gets an
+            // actionable error message instead.
+            if (!videoTs.exists() || videoTs.length() < 1024) {
+                error(
+                    "Video segment file is missing or too small: " +
+                        "${videoTs.absolutePath} (${videoTs.length()} bytes). " +
+                        "The download likely failed mid-stream.",
+                )
+            }
+            val videoSniff = sniffFileFormatDesktop(videoTs)
+            when (videoSniff) {
+                "html" -> error(
+                    "Video segment file appears to be HTML, not media data. " +
+                        "The CDN returned an error page (token expired / paywall) with HTTP 200. " +
+                        "First 200 bytes: " + peekFileTextDesktop(videoTs, 200),
+                )
+                "fmp4" -> {
+                    if (videoInitFile == null) {
+                        error(
+                            "Video segments are fragmented MP4 (CMAF) but no #EXT-X-MAP init segment " +
+                                "was found in the playlist. Without the ftyp+moov boxes ffmpeg cannot " +
+                                "demux the segments. This usually means the master playlist you " +
+                                "selected is a sub-master that does not directly contain #EXT-X-MAP, " +
+                                "or the playlist was served with a non-standard EXT-X-MAP format. " +
+                                "Try a different quality variant.",
+                        )
+                    }
+                }
+                "ts", "unknown" -> {
+                    // ffmpeg is robust enough to handle MPEG-TS and will produce its
+                    // own clear error if the format is genuinely unsupported.
+                }
+            }
+
             // 6. Build ffmpeg command:
             //    ffmpeg -i video.ts -i audio_0.ts -i audio_1.ts -i sub_0.vtt \
             //           -map 0:v -map 1:a -map 2:a -map 3:s \
@@ -312,7 +348,16 @@ internal actual object DownloadsPlatformDownloader {
 
             val exitCode = process.waitFor()
             if (exitCode != 0) {
-                error("ffmpeg failed (exit=$exitCode): ${outputLog.takeLast(2000)}")
+                // Annotate the ffmpeg failure with our sniffing info so the user
+                // doesn't have to dig through ffmpeg's stderr to figure out the
+                // root cause (ffmpeg typically says "Invalid data found when
+                // processing input" which is too generic to be actionable).
+                error(
+                    "ffmpeg failed (exit=$exitCode, videoFormat=$videoSniff, " +
+                        "videoBytes=${videoTs.length()}, audioInputs=${audioTsFiles.size}, " +
+                        "initSegment=${videoInitFile != null}). " +
+                        "Last 2000 bytes of ffmpeg log:\n" + outputLog.takeLast(2000),
+                )
             }
 
             // 8. Cleanup
@@ -429,8 +474,45 @@ internal actual object DownloadsPlatformDownloader {
                     if (conn.responseCode !in 200..299) {
                         error("HTTP ${conn.responseCode} for segment $segmentUrl")
                     }
+                    // === Content-Type validation ===
+                    // Some CDNs (e.g. StreamingCommunity's edge) return HTTP 200
+                    // with text/html body when the signed URL has expired or the
+                    // request is missing required headers. Detect that here so we
+                    // don't concatenate HTML into the .ts and have ffmpeg fail
+                    // later with a confusing "Invalid data found when processing input".
+                    val contentType = conn.contentType?.lowercase().orEmpty()
+                    if (contentType.startsWith("text/html") ||
+                        contentType.startsWith("application/xhtml") ||
+                        contentType.startsWith("text/xml")
+                    ) {
+                        val preview = conn.inputStream.bufferedReader()
+                            .use { it.readText() }
+                            .replace('\n', ' ').replace('\r', ' ')
+                            .take(200)
+                        error(
+                            "Server returned an HTML page instead of segment data for $segmentUrl " +
+                                "(Content-Type: $contentType, likely expired token or missing headers). " +
+                                "Preview: $preview",
+                        )
+                    }
+
                     val ciphertext = conn.inputStream.use { it.readBytes() }
                     onChunk(ciphertext.size.toLong())
+
+                    // === Byte-level sniffing (catches CDN edge cases where the
+                    // Content-Type header was missing or misleading). ===
+                    val sniff = HlsPlaylistParser.sniffSegmentFormat(ciphertext)
+                    if (sniff == "html") {
+                        val preview = runCatching {
+                            String(ciphertext, 0, minOf(256, ciphertext.size), Charsets.UTF_8)
+                        }.getOrDefault("")
+                        error(
+                            "Server returned an HTML page instead of segment data for $segmentUrl " +
+                                "(likely expired token or missing headers). Preview: " +
+                                preview.replace('\n', ' ').replace('\r', ' ').take(200),
+                        )
+                    }
+
                     val plaintext = if (aesKey != null && encryption != null) {
                         val iv = encryption.iv ?: HlsPlaylistParser.deriveIvFromSequence(
                             mediaSequenceStart + index,
@@ -514,5 +596,38 @@ internal actual object DownloadsPlatformDownloader {
         }
 
         return null
+    }
+
+    /**
+     * Sniff the format of a downloaded segment file by reading its first 256 bytes
+     * and delegating to [HlsPlaylistParser.sniffSegmentFormat].
+     */
+    private fun sniffFileFormatDesktop(file: File): String {
+        if (!file.exists() || file.length() == 0L) return "unknown"
+        return try {
+            file.inputStream().use { input ->
+                val header = ByteArray(256)
+                val read = input.read(header)
+                if (read <= 0) return "unknown"
+                HlsPlaylistParser.sniffSegmentFormat(
+                    if (read == header.size) header else header.copyOf(read),
+                )
+            }
+        } catch (_: Exception) {
+            "unknown"
+        }
+    }
+
+    /** Read the first [maxBytes] of [file] as UTF-8 text, for error messages. */
+    private fun peekFileTextDesktop(file: File, maxBytes: Int): String {
+        return try {
+            file.inputStream().use { input ->
+                val buf = ByteArray(maxBytes.coerceAtLeast(1))
+                val read = input.read(buf)
+                if (read <= 0) "" else String(buf, 0, read, Charsets.UTF_8)
+            }
+        } catch (_: Exception) {
+            ""
+        }.replace('\n', ' ').replace('\r', ' ').replace('\t', ' ')
     }
 }
