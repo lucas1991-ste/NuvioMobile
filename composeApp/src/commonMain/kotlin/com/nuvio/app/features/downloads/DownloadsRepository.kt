@@ -568,8 +568,17 @@ object DownloadsRepository {
                 }
                 return@launch
             }
-            if (mediaPlaylist.isEncrypted) {
-                val errorMsg = runBlocking { getString(Res.string.downloads_error_hls_encrypted) }
+            val encryption = mediaPlaylist.encryption
+            if (encryption != null && !encryption.isAes128Decryptable) {
+                val errorMsg = runBlocking {
+                    getString(
+                        if (encryption.isProprietaryDrm) {
+                            Res.string.downloads_error_hls_drm
+                        } else {
+                            Res.string.downloads_error_hls_encrypted
+                        },
+                    )
+                }
                 mutateItem(item.id) { current ->
                     current.copy(
                         status = DownloadStatus.Failed,

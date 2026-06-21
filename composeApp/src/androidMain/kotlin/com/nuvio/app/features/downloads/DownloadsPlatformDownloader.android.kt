@@ -26,6 +26,9 @@ import java.io.OutputStream
 import java.net.URI
 import java.nio.ByteBuffer
 import java.util.concurrent.TimeUnit
+import javax.crypto.Cipher
+import javax.crypto.spec.IvParameterSpec
+import javax.crypto.spec.SecretKeySpec
 
 private val downloadHttpClient = OkHttpClient.Builder()
     .dns(com.nuvio.app.core.network.AndroidDnsProvider)
@@ -327,9 +330,7 @@ internal actual object DownloadsPlatformDownloader {
                     videoPlaylistContent, request.video.playlistUrl,
                 )
                 if (videoPlaylist.segments.isEmpty()) error("Empty video playlist")
-                if (videoPlaylist.isEncrypted) {
-                    error(runBlocking { getString(Res.string.downloads_error_hls_encrypted) })
-                }
+                validateEncryption(videoPlaylist.encryption)
 
                 // 2. Fetch + parse audio playlists
                 val audioPlaylists = request.audioTracks.map { track ->
@@ -337,7 +338,7 @@ internal actual object DownloadsPlatformDownloader {
                         ?: error("Failed to fetch audio playlist: ${track.name}")
                     val pl = HlsPlaylistParser.parseMediaPlaylist(content, track.playlistUrl)
                     if (pl.segments.isEmpty()) error("Empty audio playlist: ${track.name}")
-                    if (pl.isEncrypted) error(runBlocking { getString(Res.string.downloads_error_hls_encrypted) })
+                    validateEncryption(pl.encryption)
                     TrackPlaylist(track, pl)
                 }
 
@@ -347,6 +348,7 @@ internal actual object DownloadsPlatformDownloader {
                         ?: error("Failed to fetch subtitle playlist: ${track.name}")
                     val pl = HlsPlaylistParser.parseMediaPlaylist(content, track.playlistUrl)
                     if (pl.segments.isEmpty()) error("Empty subtitle playlist: ${track.name}")
+                    validateEncryption(pl.encryption)
                     TrackPlaylist(track, pl)
                 }
 
@@ -357,6 +359,8 @@ internal actual object DownloadsPlatformDownloader {
                     segmentUrls = videoPlaylist.segments.map { it.url },
                     headers = request.sourceHeaders,
                     outFile = videoTsFile,
+                    encryption = videoPlaylist.encryption,
+                    mediaSequenceStart = videoPlaylist.mediaSequence,
                     onChunk = { bytes ->
                         totalDownloaded += bytes
                         onProgress(totalDownloaded, null)
@@ -370,6 +374,8 @@ internal actual object DownloadsPlatformDownloader {
                         segmentUrls = tp.playlist.segments.map { it.url },
                         headers = request.sourceHeaders,
                         outFile = f,
+                        encryption = tp.playlist.encryption,
+                        mediaSequenceStart = tp.playlist.mediaSequence,
                         onChunk = { bytes ->
                             totalDownloaded += bytes
                             onProgress(totalDownloaded, null)
@@ -457,15 +463,93 @@ internal actual object DownloadsPlatformDownloader {
         val playlist: HlsMediaPlaylist,
     )
 
+    /**
+     * Reject playlists that cannot be downloaded. AES-128 with http(s)/data: URI
+     * is allowed (decryption happens in [downloadSegmentsToTsFile]). Everything
+     * else (SAMPLE-AES, FairPlay, Widevine, PlayReady, or AES-128 with a custom
+     * non-http URI) is rejected with a clear error.
+     */
+    private fun validateEncryption(encryption: HlsEncryption?) {
+        if (encryption == null) return
+        if (encryption.isAes128Decryptable) return
+        if (encryption.isProprietaryDrm) {
+            error(runBlocking { getString(Res.string.downloads_error_hls_drm) })
+        }
+        // AES-128 with a non-http URI we cannot fetch (e.g. custom scheme).
+        error(runBlocking { getString(Res.string.downloads_error_hls_encrypted) })
+    }
+
+    /**
+     * Fetch the AES-128 key. Supports both HTTP(S) URIs (with headers) and
+     * inline `data:` URIs (RFC 2397). Returns 16 raw bytes per HLS spec.
+     */
+    private fun fetchKey(
+        encryption: HlsEncryption,
+        headers: Map<String, String> = emptyMap(),
+    ): ByteArray {
+        val uri = encryption.keyUri ?: error("AES-128 encryption with no URI")
+        val lower = uri.lowercase()
+        if (lower.startsWith("data:")) {
+            return HlsPlaylistParser.decodeDataUri(uri)
+                ?: error("Failed to decode data: key URI")
+        }
+        val requestBuilder = Request.Builder().url(uri)
+        // Propagate the same headers used for segments (Authorization, Referer,
+        // User-Agent, ...). Some CDNs require them even for the key endpoint.
+        headers.forEach { (k, v) -> requestBuilder.header(k, v) }
+        val response = downloadHttpClient.newCall(requestBuilder.get().build()).execute()
+        response.use { resp ->
+            if (!resp.isSuccessful) {
+                error("Failed to fetch AES-128 key: HTTP ${resp.code}")
+            }
+            val body = resp.body ?: error("Empty AES-128 key response body")
+            val bytes = body.bytes()
+            if (bytes.size != 16) {
+                error("AES-128 key must be 16 bytes, got ${bytes.size}")
+            }
+            return bytes
+        }
+    }
+
+    /**
+     * Decrypt one HLS segment with AES-128-CBC. HLS uses NoPadding: each
+     * segment is padded to a 16-byte boundary by the packager (the last
+     * block is completed with arbitrary bytes), so the cleartext length
+     * equals the ciphertext length. After decryption, trailing pad bytes
+     * must be discarded by the muxer (MediaExtractor handles them as part
+     * of the TS framing, so we keep them).
+     */
+    private fun decryptSegment(
+        ciphertext: ByteArray,
+        key: ByteArray,
+        iv: ByteArray,
+    ): ByteArray {
+        require(key.size == 16) { "AES-128 key must be 16 bytes" }
+        require(iv.size == 16) { "AES IV must be 16 bytes" }
+        val cipher = Cipher.getInstance("AES/CBC/NoPadding")
+        cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
+        return cipher.doFinal(ciphertext)
+    }
+
     private fun downloadSegmentsToTsFile(
         segmentUrls: List<String>,
         headers: Map<String, String>,
         outFile: File,
+        encryption: HlsEncryption?,
+        mediaSequenceStart: Long,
         onChunk: (bytesDelta: Long) -> Unit,
         job: Job,
     ) {
+        // Resolve the key once per playlist; the IV is per-segment (either
+        // fixed by #EXT-X-KEY or derived from MEDIA-SEQUENCE per HLS spec).
+        val aesKey: ByteArray? = if (encryption?.isAes128Decryptable == true) {
+            fetchKey(encryption, headers)
+        } else {
+            null
+        }
+
         outFile.outputStream().use { output ->
-            for (segmentUrl in segmentUrls) {
+            segmentUrls.forEachIndexed { index, segmentUrl ->
                 job.ensureActive()
                 val requestBuilder = Request.Builder().url(segmentUrl)
                 headers.forEach { (k, v) -> requestBuilder.header(k, v) }
@@ -477,16 +561,21 @@ internal actual object DownloadsPlatformDownloader {
                     val body = resp.body ?: error(
                         runBlocking { getString(Res.string.downloads_error_empty_body) },
                     )
-                    body.byteStream().use { input ->
-                        val buffer = ByteArray(16 * 1024)
-                        while (true) {
-                            job.ensureActive()
-                            val read = input.read(buffer)
-                            if (read <= 0) break
-                            output.write(buffer, 0, read)
-                            onChunk(read.toLong())
-                        }
+                    // Read full segment into memory: AES-128-CBC needs the
+                    // complete ciphertext before decryption; segments are
+                    // typically 2-10 MB so this is acceptable. For very
+                    // long segments a streaming approach would be needed.
+                    val ciphertext = body.bytes()
+                    onChunk(ciphertext.size.toLong())
+                    val plaintext = if (aesKey != null && encryption != null) {
+                        val iv = encryption.iv ?: HlsPlaylistParser.deriveIvFromSequence(
+                            mediaSequenceStart + index,
+                        )
+                        decryptSegment(ciphertext, aesKey, iv)
+                    } else {
+                        ciphertext
                     }
+                    output.write(plaintext)
                 }
             }
             output.flush()

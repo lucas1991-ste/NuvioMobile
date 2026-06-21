@@ -11,9 +11,9 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -109,15 +109,17 @@ fun DownloadsHlsSelectionSheet(
     }
 
     // Audio tracks: multi-select. Default = the track flagged DEFAULT in the master playlist.
+    // Selection state is keyed by track index, not by URI, because multiple tracks may share
+    // the same (or empty) URI and would otherwise collapse into a single toggle.
     val audioTracks = remember(playlist) { playlist?.audioTracks.orEmpty() }
-    var selectedAudioUrls by remember(audioTracks) {
-        mutableStateOf(audioTracks.filter { it.isDefault }.map { it.uri ?: "" }.toSet())
+    var selectedAudioIndices by remember(audioTracks) {
+        mutableStateOf(audioTracks.mapIndexed { index, track -> index }.filter { audioTracks[it].isDefault }.toSet())
     }
 
     // Subtitle tracks: multi-select. Default = empty (no subtitles).
     val subtitleTracks = remember(playlist) { playlist?.subtitleTracks.orEmpty() }
-    var selectedSubtitleUrls by remember(subtitleTracks) {
-        mutableStateOf(emptySet<String>())
+    var selectedSubtitleIndices by remember(subtitleTracks) {
+        mutableStateOf(emptySet<Int>())
     }
 
     var selectedQualityKey by remember(qualityOptions) {
@@ -202,6 +204,7 @@ fun DownloadsHlsSelectionSheet(
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
+                            .verticalScroll(rememberScrollState())
                             .padding(horizontal = 16.dp),
                         verticalArrangement = Arrangement.spacedBy(12.dp),
                     ) {
@@ -234,24 +237,24 @@ fun DownloadsHlsSelectionSheet(
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
-                            LazyColumn(
+                            Column(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .heightIn(max = 240.dp),
+                                    .heightIn(max = 200.dp)
+                                    .verticalScroll(rememberScrollState()),
                                 verticalArrangement = Arrangement.spacedBy(2.dp),
                             ) {
-                                items(audioTracks) { track ->
-                                    val trackUri = track.uri ?: ""
-                                    val isSelected = trackUri in selectedAudioUrls
+                                audioTracks.forEachIndexed { index, track ->
+                                    val isSelected = index in selectedAudioIndices
                                     SelectableTrackRow(
                                         name = track.name,
                                         language = track.language,
                                         isSelected = isSelected,
                                         onToggle = {
-                                            selectedAudioUrls = if (isSelected) {
-                                                selectedAudioUrls - trackUri
+                                            selectedAudioIndices = if (isSelected) {
+                                                selectedAudioIndices - index
                                             } else {
-                                                selectedAudioUrls + trackUri
+                                                selectedAudioIndices + index
                                             }
                                         },
                                     )
@@ -278,24 +281,24 @@ fun DownloadsHlsSelectionSheet(
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
-                            LazyColumn(
+                            Column(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .heightIn(max = 240.dp),
+                                    .heightIn(max = 200.dp)
+                                    .verticalScroll(rememberScrollState()),
                                 verticalArrangement = Arrangement.spacedBy(2.dp),
                             ) {
-                                items(subtitleTracks) { track ->
-                                    val trackUri = track.uri ?: ""
-                                    val isSelected = trackUri in selectedSubtitleUrls
+                                subtitleTracks.forEachIndexed { index, track ->
+                                    val isSelected = index in selectedSubtitleIndices
                                     SelectableTrackRow(
                                         name = track.name,
                                         language = track.language,
                                         isSelected = isSelected,
                                         onToggle = {
-                                            selectedSubtitleUrls = if (isSelected) {
-                                                selectedSubtitleUrls - trackUri
+                                            selectedSubtitleIndices = if (isSelected) {
+                                                selectedSubtitleIndices - index
                                             } else {
-                                                selectedSubtitleUrls + trackUri
+                                                selectedSubtitleIndices + index
                                             }
                                         },
                                     )
@@ -319,8 +322,9 @@ fun DownloadsHlsSelectionSheet(
                                     it.url == selectedQualityKey
                                 }
                                 val audioSelections = audioTracks
-                                    .filter { (it.uri ?: "") in selectedAudioUrls }
-                                    .map { track ->
+                                    .mapIndexed { index, track -> index to track }
+                                    .filter { (index, _) -> index in selectedAudioIndices }
+                                    .map { (_, track) ->
                                         HlsTrackSelection(
                                             url = track.uri.orEmpty(),
                                             name = track.name,
@@ -328,8 +332,9 @@ fun DownloadsHlsSelectionSheet(
                                         )
                                     }
                                 val subtitleSelections = subtitleTracks
-                                    .filter { (it.uri ?: "") in selectedSubtitleUrls }
-                                    .map { track ->
+                                    .mapIndexed { index, track -> index to track }
+                                    .filter { (index, _) -> index in selectedSubtitleIndices }
+                                    .map { (_, track) ->
                                         HlsTrackSelection(
                                             url = track.uri.orEmpty(),
                                             name = track.name,

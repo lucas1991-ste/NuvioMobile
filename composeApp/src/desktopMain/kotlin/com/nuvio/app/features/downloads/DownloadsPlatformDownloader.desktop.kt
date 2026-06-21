@@ -4,6 +4,9 @@ import java.io.File
 import java.net.HttpURLConnection
 import java.net.URI
 import java.net.URL
+import javax.crypto.Cipher
+import javax.crypto.spec.IvParameterSpec
+import javax.crypto.spec.SecretKeySpec
 import kotlin.concurrent.thread
 
 internal class DesktopDownloadsTaskHandle(private val thread: Thread) : DownloadsTaskHandle {
@@ -126,7 +129,7 @@ internal actual object DownloadsPlatformDownloader {
                 videoPlaylistContent, request.video.playlistUrl,
             )
             if (videoPlaylist.segments.isEmpty()) error("Empty video playlist")
-            if (videoPlaylist.isEncrypted) error("Cannot download: stream is encrypted (EXT-X-KEY)")
+            validateEncryptionDesktop(videoPlaylist.encryption)
 
             // 2. Fetch + parse audio playlists
             val audioPlaylists = request.audioTracks.map { track ->
@@ -134,7 +137,7 @@ internal actual object DownloadsPlatformDownloader {
                     ?: error("Failed to fetch audio playlist: ${track.name}")
                 val pl = HlsPlaylistParser.parseMediaPlaylist(content, track.playlistUrl)
                 if (pl.segments.isEmpty()) error("Empty audio playlist: ${track.name}")
-                if (pl.isEncrypted) error("Cannot download: stream is encrypted (EXT-X-KEY)")
+                validateEncryptionDesktop(pl.encryption)
                 TrackPlaylist(track, pl)
             }
 
@@ -144,6 +147,7 @@ internal actual object DownloadsPlatformDownloader {
                     ?: error("Failed to fetch subtitle playlist: ${track.name}")
                 val pl = HlsPlaylistParser.parseMediaPlaylist(content, track.playlistUrl)
                 if (pl.segments.isEmpty()) error("Empty subtitle playlist: ${track.name}")
+                validateEncryptionDesktop(pl.encryption)
                 TrackPlaylist(track, pl)
             }
 
@@ -154,6 +158,8 @@ internal actual object DownloadsPlatformDownloader {
                 segmentUrls = videoPlaylist.segments.map { it.url },
                 headers = request.sourceHeaders,
                 outFile = videoTs,
+                encryption = videoPlaylist.encryption,
+                mediaSequenceStart = videoPlaylist.mediaSequence,
                 onChunk = { bytes ->
                     totalDownloaded += bytes
                     onProgress(totalDownloaded, null)
@@ -166,6 +172,8 @@ internal actual object DownloadsPlatformDownloader {
                     segmentUrls = tp.playlist.segments.map { it.url },
                     headers = request.sourceHeaders,
                     outFile = f,
+                    encryption = tp.playlist.encryption,
+                    mediaSequenceStart = tp.playlist.mediaSequence,
                     onChunk = { bytes ->
                         totalDownloaded += bytes
                         onProgress(totalDownloaded, null)
@@ -283,14 +291,68 @@ internal actual object DownloadsPlatformDownloader {
         val playlist: HlsMediaPlaylist,
     )
 
+    private fun validateEncryptionDesktop(encryption: HlsEncryption?) {
+        if (encryption == null) return
+        if (encryption.isAes128Decryptable) return
+        if (encryption.isProprietaryDrm) {
+            error("Cannot download: stream uses a proprietary DRM system (FairPlay / Widevine / PlayReady)")
+        }
+        error("Cannot download: stream is encrypted with an unsupported method")
+    }
+
+    private fun fetchKeyDesktop(
+        encryption: HlsEncryption,
+        headers: Map<String, String>,
+    ): ByteArray {
+        val uri = encryption.keyUri ?: error("AES-128 encryption with no URI")
+        if (uri.lowercase().startsWith("data:")) {
+            return HlsPlaylistParser.decodeDataUri(uri)
+                ?: error("Failed to decode data: key URI")
+        }
+        val conn = URL(uri).openConnection() as HttpURLConnection
+        headers.forEach { (k, v) -> conn.setRequestProperty(k, v) }
+        conn.connect()
+        try {
+            if (conn.responseCode !in 200..299) {
+                error("HTTP ${conn.responseCode} for AES-128 key $uri")
+            }
+            val bytes = conn.inputStream.use { it.readBytes() }
+            if (bytes.size != 16) {
+                error("AES-128 key must be 16 bytes, got ${bytes.size}")
+            }
+            return bytes
+        } finally {
+            conn.disconnect()
+        }
+    }
+
+    private fun decryptSegmentDesktop(
+        ciphertext: ByteArray,
+        key: ByteArray,
+        iv: ByteArray,
+    ): ByteArray {
+        require(key.size == 16) { "AES-128 key must be 16 bytes" }
+        require(iv.size == 16) { "AES IV must be 16 bytes" }
+        val cipher = Cipher.getInstance("AES/CBC/NoPadding")
+        cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
+        return cipher.doFinal(ciphertext)
+    }
+
     private fun downloadSegmentsToTsFileDesktop(
         segmentUrls: List<String>,
         headers: Map<String, String>,
         outFile: File,
+        encryption: HlsEncryption?,
+        mediaSequenceStart: Long,
         onChunk: (bytesDelta: Long) -> Unit,
     ) {
+        val aesKey: ByteArray? = if (encryption?.isAes128Decryptable == true) {
+            fetchKeyDesktop(encryption, headers)
+        } else {
+            null
+        }
         outFile.outputStream().use { output ->
-            for (segmentUrl in segmentUrls) {
+            segmentUrls.forEachIndexed { index, segmentUrl ->
                 if (Thread.currentThread().isInterrupted) error("Download cancelled")
                 val url = URL(segmentUrl)
                 val conn = url.openConnection() as HttpURLConnection
@@ -300,16 +362,17 @@ internal actual object DownloadsPlatformDownloader {
                     if (conn.responseCode !in 200..299) {
                         error("HTTP ${conn.responseCode} for segment $segmentUrl")
                     }
-                    conn.inputStream.use { input ->
-                        val buffer = ByteArray(16 * 1024)
-                        while (true) {
-                            if (Thread.currentThread().isInterrupted) error("Download cancelled")
-                            val read = input.read(buffer)
-                            if (read <= 0) break
-                            output.write(buffer, 0, read)
-                            onChunk(read.toLong())
-                        }
+                    val ciphertext = conn.inputStream.use { it.readBytes() }
+                    onChunk(ciphertext.size.toLong())
+                    val plaintext = if (aesKey != null && encryption != null) {
+                        val iv = encryption.iv ?: HlsPlaylistParser.deriveIvFromSequence(
+                            mediaSequenceStart + index,
+                        )
+                        decryptSegmentDesktop(ciphertext, aesKey, iv)
+                    } else {
+                        ciphertext
                     }
+                    output.write(plaintext)
                 } finally {
                     conn.disconnect()
                 }

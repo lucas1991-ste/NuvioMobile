@@ -1650,7 +1650,8 @@
 <string name="downloads_hls_subtitle_hint">Tocca per attivare/disattivare. Scegli quali lingue dei sottotitoli incorporare.</string>
 <string name="downloads_hls_no_audio">Nessuna traccia audio disponibile</string>
 <string name="downloads_hls_no_subtitles">Nessun sottotitolo disponibile</string>
-<string name="downloads_error_hls_encrypted">Impossibile scaricare: lo stream è cifrato (EXT-X-KEY)</string>
+<string name="downloads_error_hls_encrypted">Impossibile scaricare: stream cifrato con metodo non supportato</string>
+<string name="downloads_error_hls_drm">Impossibile scaricare: lo stream utilizza un DRM proprierario (FairPlay / Widevine / PlayReady)</string>
 <string name="downloads_error_ffmpeg_missing">ffmpeg non trovato. Installa ffmpeg e riprova.</string>
 <string name="downloads_error_remux_failed">Impossibile fare il remux delle tracce in MP4: %1$s</string>
 <string name="player_action_submit_intro">Invia intro</string>

@@ -27,7 +27,77 @@ data class HlsMediaPlaylist(
     val segments: List<HlsSegment>,
     val targetDuration: Double = 0.0,
     val isEncrypted: Boolean = false,
+    val encryption: HlsEncryption? = null,
+    val mediaSequence: Long = 0L,
 )
+
+/**
+ * Encryption metadata extracted from #EXT-X-KEY.
+ *
+ * - [method]: NONE | AES-128 | SAMPLE-AES | SAMPLE-AES-CTR | ...
+ * - [keyUri]: the URI= attribute (may be HTTP/HTTPS for AES-128, or a custom scheme
+ *   like skd://, data:, widevine:, playready: for DRM systems).
+ * - [iv]: the IV= attribute parsed as 16 raw bytes, or null when not present
+ *   (HLS spec mandates the client derive it from the segment's MEDIA-SEQUENCE
+ *   number, as a 128-bit big-endian integer).
+ * - [keyFormat]: optional KEYFORMAT= attribute (e.g.
+ *   "com.apple.streamingkeydelivery" for FairPlay,
+ *   "urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed" for Widevine,
+ *   "com.microsoft.playready" for PlayReady).
+ * - [keyFormatVersions]: optional KEYFORMATVERSIONS= attribute.
+ */
+data class HlsEncryption(
+    val method: String,
+    val keyUri: String?,
+    val iv: ByteArray?,
+    val keyFormat: String?,
+    val keyFormatVersions: String?,
+) {
+    /**
+     * True when this encryption can be decrypted client-side by the app's own
+     * AES-128 implementation (METHOD=AES-128 with HTTP/HTTPS or data: URI,
+     * no proprietary KEYFORMAT).
+     */
+    val isAes128Decryptable: Boolean
+        get() {
+            if (!method.equals("AES-128", ignoreCase = true)) return false
+            val uri = keyUri?.trim() ?: return false
+            val lower = uri.lowercase()
+            // data: URIs embed the key inline, http(s) can be fetched with headers.
+            if (lower.startsWith("http://") || lower.startsWith("https://")) {
+                // Refuse any explicit DRM keyformat even on http(s) URIs.
+                return !isProprietaryKeyFormat
+            }
+            if (lower.startsWith("data:")) return !isProprietaryKeyFormat
+            return false
+        }
+
+    /**
+     * True when this encryption uses a proprietary DRM system that cannot be
+     * decrypted without the OS-level DRM framework (FairPlay / Widevine /
+     * PlayReady). The app's downloader cannot save these streams.
+     */
+    val isProprietaryDrm: Boolean
+        get() {
+            val methodUpper = method.uppercase()
+            if (methodUpper.startsWith("SAMPLE-AES")) return true
+            return isProprietaryKeyFormat
+        }
+
+    private val isProprietaryKeyFormat: Boolean
+        get() {
+            val kf = keyFormat?.trim()?.lowercase() ?: return false
+            // Known DRM keyformats per HLS spec & community conventions.
+            return when {
+                kf.contains("streamingkeydelivery") -> true // FairPlay
+                kf.contains("edef8ba9-79d6-4ace-a3c8-27dcd51d21ed") -> true // Widevine UUID
+                kf.contains("widevine") -> true
+                kf.contains("playready") -> true // PlayReady
+                kf.contains("com.microsoft") -> true
+                else -> false
+            }
+        }
+}
 
 data class HlsSegment(
     val duration: Double,
@@ -114,7 +184,8 @@ object HlsPlaylistParser {
         var targetDuration = 0.0
         var currentDuration = 0.0
         var pendingDiscontinuity = false
-        var isEncrypted = false
+        var currentEncryption: HlsEncryption? = null
+        var mediaSequence = 0L
 
         for (line in lines) {
             val trimmed = line.trim()
@@ -122,10 +193,30 @@ object HlsPlaylistParser {
                 trimmed.startsWith("#EXT-X-TARGETDURATION:") -> {
                     targetDuration = trimmed.substringAfter(":").trim().toDoubleOrNull() ?: 0.0
                 }
+                trimmed.startsWith("#EXT-X-MEDIA-SEQUENCE:") -> {
+                    mediaSequence = trimmed.substringAfter(":").trim().toLongOrNull() ?: 0L
+                }
                 trimmed.startsWith("#EXT-X-KEY:") -> {
                     val attrs = parseAttributes(trimmed.removePrefix("#EXT-X-KEY:"))
                     val method = attrs["METHOD"]?.trim()?.uppercase() ?: ""
-                    if (method != "NONE") isEncrypted = true
+                    // METHOD=NONE explicitly disables encryption for the segments
+                    // that follow, per HLS spec.
+                    if (method == "NONE") {
+                        currentEncryption = null
+                    } else {
+                        val rawUri = attrs["URI"]?.trim()?.let { removeQuotes(it) }
+                        val resolvedUri = rawUri?.let { resolveUrl(it, baseUrl) }
+                        // For data: URIs we keep the original (already inlined),
+                        // not resolved relative to baseUrl.
+                        val finalUri = rawUri?.takeIf { it.lowercase().startsWith("data:") } ?: resolvedUri
+                        currentEncryption = HlsEncryption(
+                            method = method,
+                            keyUri = finalUri,
+                            iv = attrs["IV"]?.trim()?.let { parseIv(it) },
+                            keyFormat = attrs["KEYFORMAT"]?.trim()?.let { removeQuotes(it) },
+                            keyFormatVersions = attrs["KEYFORMATVERSIONS"]?.trim()?.let { removeQuotes(it) },
+                        )
+                    }
                 }
                 trimmed.startsWith("#EXT-X-DISCONTINUITY") && !trimmed.startsWith("#EXT-X-DISCONTINUITY-SEQUENCE") -> {
                     pendingDiscontinuity = true
@@ -149,7 +240,114 @@ object HlsPlaylistParser {
             }
         }
 
-        return HlsMediaPlaylist(segments, targetDuration, isEncrypted)
+        val isEncrypted = currentEncryption != null
+        return HlsMediaPlaylist(
+            segments = segments,
+            targetDuration = targetDuration,
+            isEncrypted = isEncrypted,
+            encryption = currentEncryption,
+            mediaSequence = mediaSequence,
+        )
+    }
+
+    /**
+     * Parse an IV= attribute from #EXT-X-KEY.
+     * Accepted formats (per HLS spec, section 4.3.2.4):
+     *   - 0x followed by 32 hex chars (128-bit big-endian)
+     *   - 32 hex chars without 0x prefix
+     * Returns 16 raw bytes, or null if the input is malformed.
+     */
+    private fun parseIv(value: String): ByteArray? {
+        val cleaned = value.trim().removePrefix("0x").removePrefix("0X")
+        if (cleaned.length != 32) return null
+        if (!cleaned.all { it.isDigit() || it.lower() in 'a'..'f' }) return null
+        return cleaned.chunked(2) { byteStr ->
+            byteStr.toString().toInt(16).toByte()
+        }.toByteArray()
+    }
+
+    /**
+     * Build the IV for a segment when #EXT-X-KEY did not specify one.
+     * Per HLS spec (section 5.2): when IV is absent, the IV for segment N
+     * (with MEDIA-SEQUENCE = N) is the 128-bit big-endian representation of N.
+     */
+    fun deriveIvFromSequence(sequenceNumber: Long): ByteArray {
+        val iv = ByteArray(16)
+        var v = sequenceNumber
+        // Write as big-endian in the last 8 bytes (long). The first 8 bytes stay 0.
+        for (i in 15 downTo 8) {
+            iv[i] = (v and 0xFFL).toByte()
+            v = v ushr 8
+        }
+        return iv
+    }
+
+    /**
+     * Decode a `data:` URI payload (RFC 2397) into raw bytes.
+     * Accepts both `data:<mediatype>;base64,<payload>` and `data:<mediatype>,<payload>`.
+     * Returns null if the URI is malformed.
+     *
+     * Implemented in commonMain without java.util.Base64 to stay multiplatform-safe;
+     * we use a small base64 decoder.
+     */
+    fun decodeDataUri(uri: String): ByteArray? {
+        val trimmed = uri.trim()
+        if (!trimmed.lowercase().startsWith("data:")) return null
+        val commaIdx = trimmed.indexOf(',')
+        if (commaIdx < 0) return null
+        val header = trimmed.substring(5, commaIdx) // between "data:" and ","
+        val payload = trimmed.substring(commaIdx + 1)
+        val isBase64 = header.lowercase().contains("base64")
+        return if (isBase64) {
+            base64Decode(payload)
+        } else {
+            // Percent-decoded UTF-8 bytes; HLS keys rarely use this form but spec allows it.
+            percentDecode(payload).toByteArray(Charsets.UTF_8)
+        }
+    }
+
+    private fun base64Decode(input: String): ByteArray? {
+        val cleaned = input.filter { !it.isWhitespace() }
+        if (cleaned.isEmpty()) return ByteArray(0)
+        val alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+        val table = IntArray(128) { -1 }
+        alphabet.forEachIndexed { idx, c -> table[c.code] = idx }
+        table['='.code] = 0 // padding placeholder
+        if (cleaned.length % 4 != 0) return null
+        val out = mutableListOf<Byte>()
+        var i = 0
+        while (i < cleaned.length) {
+            val a = table.getOrNull(cleaned[i].code) ?: return null
+            val b = table.getOrNull(cleaned[i + 1].code) ?: return null
+            val c = table.getOrNull(cleaned[i + 2].code) ?: return null
+            val d = table.getOrNull(cleaned[i + 3].code) ?: return null
+            val triple = (a shl 18) or (b shl 12) or (c shl 6) or d
+            out.add(((triple ushr 16) and 0xFF).toByte())
+            if (cleaned[i + 2] != '=') out.add(((triple ushr 8) and 0xFF).toByte())
+            if (cleaned[i + 3] != '=') out.add((triple and 0xFF).toByte())
+            i += 4
+        }
+        return out.toByteArray()
+    }
+
+    private fun percentDecode(input: String): String {
+        val sb = StringBuilder(input.length)
+        var i = 0
+        while (i < input.length) {
+            val c = input[i]
+            if (c == '%' && i + 2 < input.length) {
+                val hex = input.substring(i + 1, i + 3)
+                val code = hex.toIntOrNull(16) ?: run {
+                    sb.append(c); i++; continue
+                }
+                sb.append(code.toChar())
+                i += 3
+            } else {
+                sb.append(c)
+                i++
+            }
+        }
+        return sb.toString()
     }
 
     /**
