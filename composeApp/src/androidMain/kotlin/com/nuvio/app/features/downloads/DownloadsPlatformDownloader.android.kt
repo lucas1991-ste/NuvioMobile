@@ -5,9 +5,9 @@ import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.net.Uri
 import androidx.documentfile.provider.DocumentFile
-import androidx.media3.common.BufferInfo
 import androidx.media3.common.Format
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.muxer.BufferInfo
 import androidx.media3.muxer.Mp4Muxer
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -1021,15 +1021,31 @@ internal actual object DownloadsPlatformDownloader {
             // MediaExtractor (framework) is still used for READING the .ts
             // because media3 does not expose a public drop-in extractor API
             // equivalent to MediaExtractor.selectTrack/readSampleData.
+            //
+            // === media3 1.8.0 API notes (verified from the actual JAR) ===
+            // - Mp4Muxer.addTrack(Format) returns Int (track ID), NOT a
+            //   TrackToken object. The Muxer interface declares it as int.
+            // - Mp4Muxer.writeSampleData(int trackId, ByteBuffer, BufferInfo)
+            //   takes the int track ID returned by addTrack.
+            // - BufferInfo lives at androidx.media3.muxer.BufferInfo (NOT
+            //   androidx.media3.common.BufferInfo — that doesn't exist).
+            // - BufferInfo has a 3-arg constructor (presentationTimeUs, size,
+            //   flags). NO offset field (unlike MediaCodec.BufferInfo).
+            // - The muxer reads from buffer.position() to buffer.limit(), so
+            //   after MediaExtractor.readSampleData we MUST set buffer.limit(size)
+            //   to tell the muxer exactly how many bytes are valid.
+            // - MediaExtractor.getSampleFlags() returns int values that happen
+            //   to match media3's C.BUFFER_FLAG_* constants (1=key_frame,
+            //   2=codec_config, 4=eos, 8=partial_frame), so we pass them through.
             val muxer = Mp4Muxer.Builder(FileOutputStream(outputMp4))
                 .build()
 
             val videoFormat = vExtractor.getTrackFormat(videoTrackIndex)
             sanitizeMediaFormatDuration(videoFormat)
-            val videoOutToken = muxer.addTrack(toMedia3Format(videoFormat))
+            val videoOutTrackId: Int = muxer.addTrack(toMedia3Format(videoFormat))
 
             // External audio tracks (one per separate .ts file).
-            val externalAudioTokens = audioExtractors.mapIndexed { idx, ext ->
+            val externalAudioTrackIds: List<Int> = audioExtractors.mapIndexed { idx, ext ->
                 val format = ext.getTrackFormat(audioTrackIndices[idx])
                 sanitizeMediaFormatDuration(format)
                 audioTracks.getOrNull(idx)?.language?.takeIf { it.isNotBlank() }?.let { lang ->
@@ -1040,7 +1056,7 @@ internal actual object DownloadsPlatformDownloader {
 
             // Embedded audio tracks (only those that have at least 1 sample).
             // Also sanitize duration on each.
-            val embeddedAudioTokens = embeddedAudioTrackIndices.map { idx ->
+            val embeddedAudioTrackIds: List<Int> = embeddedAudioTrackIndices.map { idx ->
                 val format = vExtractor.getTrackFormat(idx)
                 sanitizeMediaFormatDuration(format)
                 muxer.addTrack(toMedia3Format(format))
@@ -1050,44 +1066,39 @@ internal actual object DownloadsPlatformDownloader {
 
             // === Per-track sample counters (for diagnostics at close()) ===
             var videoSampleCount = 0L
-            val embeddedAudioSampleCounts = LongArray(embeddedAudioTokens.size)
-            val externalAudioSampleCounts = LongArray(externalAudioTokens.size)
+            val embeddedAudioSampleCounts = LongArray(embeddedAudioTrackIds.size)
+            val externalAudioSampleCounts = LongArray(externalAudioTrackIds.size)
 
             // === PTS tracking (for monotonic validation) ===
             // Mp4Muxer requires non-decreasing PTS within each track AND
             // across tracks (when interleaved). If we see a regression, we
             // clamp the new PTS to the previous one to avoid write failures.
             var lastVideoPts: Long = Long.MIN_VALUE
-            val lastEmbeddedPts = LongArray(embeddedAudioTokens.size) { Long.MIN_VALUE }
-            val lastExternalPts = LongArray(externalAudioTokens.size) { Long.MIN_VALUE }
+            val lastEmbeddedPts = LongArray(embeddedAudioTrackIds.size) { Long.MIN_VALUE }
+            val lastExternalPts = LongArray(externalAudioTrackIds.size) { Long.MIN_VALUE }
 
             // Video + embedded audio samples are interleaved by the extractor
             // (MediaExtractor advances through samples of all selected tracks
             // in presentation order). We route each sample to its destination
             // track based on which track the extractor is currently at.
-            //
-            // Note: media3's BufferInfo is immutable and created via the
-            // BufferInfo.create() factory method (unlike android.media.MediaCodec
-            // .BufferInfo which has mutable fields). The int flags returned by
-            // MediaExtractor.getSampleFlags() use the same values as media3's
-            // BUFFER_FLAG_* constants (1=key_frame, 2=codec_config, 4=eos),
-            // so they can be passed through directly.
             while (true) {
                 buffer.clear()
                 val size = vExtractor.readSampleData(buffer, 0)
                 if (size < 0) break
+                // Tell the muxer only 'size' bytes are valid in the buffer.
+                // Mp4Muxer reads from buffer.position() to buffer.limit().
+                buffer.limit(size)
                 val flags = vExtractor.sampleFlags
                 var pts = vExtractor.sampleTime
                 val currentTrack = vExtractor.sampleTrackIndex
                 when (currentTrack) {
                     videoTrackIndex -> {
-                        // Enforce monotonic PTS (clamp if regression).
                         if (pts < lastVideoPts) pts = lastVideoPts
                         lastVideoPts = pts
                         muxer.writeSampleData(
-                            videoOutToken,
+                            videoOutTrackId,
                             buffer,
-                            BufferInfo.create(0, size, pts, flags),
+                            BufferInfo(pts, size, flags),
                         )
                         videoSampleCount++
                     }
@@ -1097,9 +1108,9 @@ internal actual object DownloadsPlatformDownloader {
                             if (pts < lastEmbeddedPts[embeddedPos]) pts = lastEmbeddedPts[embeddedPos]
                             lastEmbeddedPts[embeddedPos] = pts
                             muxer.writeSampleData(
-                                embeddedAudioTokens[embeddedPos],
+                                embeddedAudioTrackIds[embeddedPos],
                                 buffer,
-                                BufferInfo.create(0, size, pts, flags),
+                                BufferInfo(pts, size, flags),
                             )
                             embeddedAudioSampleCounts[embeddedPos]++
                         }
@@ -1111,19 +1122,20 @@ internal actual object DownloadsPlatformDownloader {
 
             // External audio samples (each track sequentially).
             audioExtractors.forEachIndexed { idx, ext ->
-                val token = externalAudioTokens[idx]
+                val trackId = externalAudioTrackIds[idx]
                 while (true) {
                     buffer.clear()
                     val size = ext.readSampleData(buffer, 0)
                     if (size < 0) break
+                    buffer.limit(size)
                     val flags = ext.sampleFlags
                     var pts = ext.sampleTime
                     if (pts < lastExternalPts[idx]) pts = lastExternalPts[idx]
                     lastExternalPts[idx] = pts
                     muxer.writeSampleData(
-                        token,
+                        trackId,
                         buffer,
-                        BufferInfo.create(0, size, pts, flags),
+                        BufferInfo(pts, size, flags),
                     )
                     externalAudioSampleCounts[idx]++
                     ext.advance()
@@ -1142,10 +1154,10 @@ internal actual object DownloadsPlatformDownloader {
                     videoFormat.getLong(MediaFormat.KEY_DURATION).toString() + " us"
                 } else "unknown"
 
-                val embeddedInfo = if (embeddedAudioTokens.isEmpty()) {
+                val embeddedInfo = if (embeddedAudioTrackIds.isEmpty()) {
                     "none"
                 } else {
-                    embeddedAudioTokens.indices.joinToString(", ") { i ->
+                    embeddedAudioTrackIds.indices.joinToString(", ") { i ->
                         val trackIdx = embeddedAudioTrackIndices[i]
                         val mime = runCatching {
                             vExtractor.getTrackFormat(trackIdx).getString(MediaFormat.KEY_MIME)
@@ -1154,10 +1166,10 @@ internal actual object DownloadsPlatformDownloader {
                             (if (i < lastEmbeddedPts.size) " lastPts=${lastEmbeddedPts[i]}" else "")
                     }
                 }
-                val externalInfo = if (externalAudioTokens.isEmpty()) {
+                val externalInfo = if (externalAudioTrackIds.isEmpty()) {
                     "none"
                 } else {
-                    externalAudioTokens.indices.joinToString(", ") { i ->
+                    externalAudioTrackIds.indices.joinToString(", ") { i ->
                         val mime = runCatching {
                             audioExtractors[i].getTrackFormat(audioTrackIndices[i])
                                 .getString(MediaFormat.KEY_MIME)
