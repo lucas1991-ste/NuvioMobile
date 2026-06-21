@@ -326,9 +326,18 @@ internal actual object DownloadsPlatformDownloader {
                     request.video.playlistUrl,
                     request.sourceHeaders,
                 ) ?: error("Failed to fetch video playlist")
-                val videoPlaylist = HlsPlaylistParser.parseMediaPlaylist(
-                    videoPlaylistContent, request.video.playlistUrl,
-                )
+                val videoPlaylist = try {
+                    HlsPlaylistParser.parseMediaPlaylist(
+                        videoPlaylistContent, request.video.playlistUrl,
+                    )
+                } catch (e: Exception) {
+                    error(
+                        "Failed to parse video playlist: ${e.message}. " +
+                            "Playlist URL: ${request.video.playlistUrl}. " +
+                            "First 500 chars of playlist content: " +
+                            videoPlaylistContent.take(500).replace('\n', ' ').replace('\r', ' '),
+                    )
+                }
                 if (videoPlaylist.segments.isEmpty()) error("Empty video playlist")
                 validateEncryption(videoPlaylist.encryption)
 
@@ -727,6 +736,8 @@ internal actual object DownloadsPlatformDownloader {
         }
 
         val videoSniff = sniffFileFormat(videoTs)
+        // Read first 4KB for deep scan (covers more signatures than 256 bytes)
+        val videoHeader4k = readFileHead(videoTs, 4096)
         when (videoSniff) {
             "html" -> error(
                 "Video segment file appears to be HTML, not media data. " +
@@ -750,9 +761,39 @@ internal actual object DownloadsPlatformDownloader {
                 // MPEG-TS is self-describing; MediaExtractor handles it natively.
             }
             "unknown" -> {
-                // Could be encrypted blob already decrypted, or genuinely unknown.
-                // Don't hard-fail here; let MediaExtractor try and produce its own
-                // error, which we'll wrap below with context.
+                // === DEEP SCAN: identify the actual format from the first 4KB ===
+                // When the simple sniffer returns "unknown", run a comprehensive scan
+                // for format signatures at all offsets. This catches:
+                //   - MPEG-TS with non-zero sync offset (M2TS, custom packagers)
+                //   - H.264 Annex B elementary streams
+                //   - fMP4 segments with non-standard first box
+                //   - Playlists accidentally downloaded as segments
+                //   - Encrypted ciphertext (high entropy)
+                //   - Files produced by specific encoders (FFmpeg, x264, ...)
+                val deepScan = if (videoHeader4k.isNotEmpty()) {
+                    HlsPlaylistParser.deepScanFormat(videoHeader4k)
+                } else {
+                    "unable to read file header"
+                }
+                // Decide whether to hard-fail or let MediaExtractor try.
+                if (deepScan.contains("PLAYLIST WAS DOWNLOADED AS A SEGMENT")) {
+                    error(
+                        "Video segment file is actually an HLS playlist, not media data. " +
+                            "Deep scan: $deepScan. " +
+                            "First 256 bytes (hex): " + peekFileHex(videoTs, 256),
+                    )
+                }
+                if (deepScan.contains("High entropy")) {
+                    error(
+                        "Video segment file appears to be encrypted ciphertext. " +
+                            "Deep scan: $deepScan. " +
+                            "First 256 bytes (hex): " + peekFileHex(videoTs, 256) +
+                            ". Check whether the playlist contains #EXT-X-KEY — if not, the CDN may be " +
+                            "applying its own encryption layer that the downloader does not handle.",
+                    )
+                }
+                // For other "unknown" cases (e.g. FFmpeg-muxed file with non-standard header),
+                // include the deep scan in the error message if MediaExtractor fails below.
             }
         }
 
@@ -761,12 +802,18 @@ internal actual object DownloadsPlatformDownloader {
             videoExtractor.setDataSource(videoTs.absolutePath)
         } catch (e: Exception) {
             videoExtractor.release()
+            val deepScanInfo = if (videoSniff == "unknown" && videoHeader4k.isNotEmpty()) {
+                HlsPlaylistParser.deepScanFormat(videoHeader4k)
+            } else {
+                "sniff=$videoSniff (deep scan skipped)"
+            }
             error(
                 "MediaExtractor failed to instantiate extractor on ${videoTs.name} " +
                     "(size=${videoTs.length()} bytes, format=$videoSniff, " +
                     "initSegment=$videoInitSegmentPresent). " +
                     "Root cause: ${e.javaClass.simpleName}: ${e.message}. " +
-                    "First 32 bytes (hex): " + peekFileHex(videoTs, 32),
+                    "First 256 bytes (hex): " + peekFileHex(videoTs, 256) + ". " +
+                    "Deep scan: $deepScanInfo",
             )
         }
 
@@ -944,6 +991,23 @@ internal actual object DownloadsPlatformDownloader {
             }
         } catch (_: Exception) {
             "unknown"
+        }
+    }
+
+    /**
+     * Read the first [maxBytes] of [file] as a raw byte array, for deep scan.
+     * Returns an empty array if the file cannot be read.
+     */
+    private fun readFileHead(file: File, maxBytes: Int): ByteArray {
+        if (!file.exists() || file.length() == 0L) return ByteArray(0)
+        return try {
+            file.inputStream().use { input ->
+                val buf = ByteArray(maxBytes.coerceAtLeast(1))
+                val read = input.read(buf)
+                if (read <= 0) ByteArray(0) else if (read == buf.size) buf else buf.copyOf(read)
+            }
+        } catch (_: Exception) {
+            ByteArray(0)
         }
     }
 

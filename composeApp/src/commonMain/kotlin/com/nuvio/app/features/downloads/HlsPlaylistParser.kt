@@ -187,6 +187,163 @@ object HlsPlaylistParser {
     }
 
     /**
+     * Deep-scan a downloaded segment file's first [headerBytes] looking for
+     * known format signatures at ALL offsets, not just offset 0/4. This is
+     * the fallback when [sniffSegmentFormat] returns "unknown" — we scan the
+     * whole 4KB window for tell-tale patterns that indicate the actual format.
+     *
+     * Returns a human-readable diagnostic string suitable for inclusion in an
+     * error message. Examples:
+     *   - "MPEG-TS sync byte 0x47 found at offset 0 (188-byte packet boundary OK)"
+     *   - "MPEG-TS sync byte 0x47 found at offset 4 (likely M2TS / 192-byte packets)"
+     *   - "H.264 Annex B start code 00 00 00 01 found at offset 0"
+     *   - "ISO BMFF box 'moof' found at offset 0 (fMP4)"
+     *   - "ISO BMFF box 'ftyp' found at offset 0 (MP4)"
+     *   - "String 'FFmpeg' found at offset 24 (file was muxed by FFmpeg)"
+     *   - "String '#EXTM3U' found at offset 0 (PLAYLIST DOWNLOADED AS SEGMENT — this is a bug in the variant URL selection)"
+     *   - "High entropy (7.92 bits/byte) — file may be encrypted ciphertext"
+     *   - "No known format signatures found in first 4KB"
+     *
+     * Multiple findings are joined with "; ".
+     */
+    fun deepScanFormat(headerBytes: ByteArray): String {
+        if (headerBytes.isEmpty()) return "empty input"
+
+        val findings = mutableListOf<String>()
+
+        // === 1. MPEG-TS sync byte scan ===
+        // Look for 0x47 at every position; if found, check whether 0x47 also
+        // appears 188 bytes later (confirming 188-byte TS packet framing).
+        val tsSyncPositions = mutableListOf<Int>()
+        for (i in headerBytes.indices) {
+            if (headerBytes[i] == 0x47.toByte()) {
+                tsSyncPositions.add(i)
+                if (tsSyncPositions.size >= 4) break // first 4 hits are enough
+            }
+        }
+        if (tsSyncPositions.isNotEmpty()) {
+            val first = tsSyncPositions.first()
+            val periodic = tsSyncPositions.any { it == first + 188 } ||
+                tsSyncPositions.any { it == first + 192 } // M2TS
+            val packetSize = if (tsSyncPositions.any { it == first + 192 }) 192 else 188
+            findings.add(
+                if (periodic) {
+                    "MPEG-TS sync byte 0x47 at offset $first, periodic at ${packetSize}-byte boundary (valid MPEG-TS)"
+                } else {
+                    "MPEG-TS sync byte 0x47 at offset $first but NOT periodic (possibly corrupted or partial)"
+                },
+            )
+        }
+
+        // === 2. H.264 / H.265 Annex B start codes ===
+        // 3-byte: 00 00 01   /   4-byte: 00 00 00 01
+        for (i in 0..headerBytes.size - 4) {
+            if (headerBytes[i] == 0x00.toByte() &&
+                headerBytes[i + 1] == 0x00.toByte() &&
+                headerBytes[i + 2] == 0x00.toByte() &&
+                headerBytes[i + 3] == 0x01.toByte()
+            ) {
+                val nalType = if (i + 4 < headerBytes.size) {
+                    (headerBytes[i + 4].toInt() and 0x7E) ushr 1 // H.264 NAL type
+                } else -1
+                findings.add(
+                    "H.264/H.265 Annex B start code 00 00 00 01 at offset $i" +
+                        if (nalType >= 0) " (NAL type $nalType)" else "",
+                )
+                break
+            }
+            if (headerBytes[i] == 0x00.toByte() &&
+                headerBytes[i + 1] == 0x00.toByte() &&
+                headerBytes[i + 2] == 0x01.toByte()
+            ) {
+                findings.add("3-byte start code 00 00 01 at offset $i (MPEG-PS / H.264 Annex B)")
+                break
+            }
+        }
+
+        // === 3. ISO BMFF box types (fMP4 / MP4) ===
+        val boxTypes = listOf("ftyp", "moov", "moof", "mdat", "styp", "emsg", "sidx", "free", "skip", "uuid", "udta")
+        for (bt in boxTypes) {
+            val btBytes = bt.toByteArray(Charsets.US_ASCII)
+            for (i in 0..headerBytes.size - btBytes.size) {
+                var match = true
+                for (j in btBytes.indices) {
+                    if (headerBytes[i + j] != btBytes[j]) { match = false; break }
+                }
+                if (match) {
+                    findings.add("ISO BMFF box '$bt' at offset $i" + if (i == 0) "" else " (non-zero offset — unusual)")
+                    break
+                }
+            }
+        }
+
+        // === 4. Playlist content (the dreaded "playlist downloaded as segment") ===
+        val asText = runCatching {
+            String(headerBytes, 0, minOf(256, headerBytes.size), Charsets.US_ASCII)
+        }.getOrDefault("")
+        if (asText.contains("#EXTM3U", ignoreCase = true)) {
+            findings.add(
+                "String '#EXTM3U' found in segment data — A PLAYLIST WAS DOWNLOADED AS A SEGMENT. " +
+                    "This is a bug: the variant URL points to a master/sub-master playlist, not a media playlist. " +
+                    "The plugin should walk the master playlist recursively until it reaches actual segment URLs.",
+            )
+        }
+
+        // === 5. Encoder/muxer identifier strings ===
+        for (needle in listOf("FFmpeg", "Lavf", "Lavc", "Lavfi", "x264", "x265", "handbrake")) {
+            val needleBytes = needle.toByteArray(Charsets.US_ASCII)
+            for (i in 0..headerBytes.size - needleBytes.size) {
+                var match = true
+                for (j in needleBytes.indices) {
+                    if (headerBytes[i + j] != needleBytes[j]) { match = false; break }
+                }
+                if (match) {
+                    findings.add("String '$needle' at offset $i (file was produced by $needle)")
+                    break
+                }
+            }
+        }
+
+        // === 6. Entropy check (high entropy => likely encrypted) ===
+        val entropy = computeEntropy(headerBytes)
+        if (entropy > 7.5) {
+            findings.add(
+                "High entropy (%.2f bits/byte over first %d bytes) — file looks like encrypted ciphertext or compressed data. ".format(entropy, headerBytes.size) +
+                    "If the playlist has no #EXT-X-KEY, the encryption may be applied at a layer above HLS (e.g. CDN token encryption).",
+            )
+        } else if (entropy < 4.0 && findings.isEmpty()) {
+            findings.add("Low entropy (%.2f bits/byte) — file may be highly repetitive or zero-padded".format(entropy))
+        }
+
+        return if (findings.isEmpty()) {
+            "No known format signatures found in first ${headerBytes.size} bytes"
+        } else {
+            findings.joinToString("; ")
+        }
+    }
+
+    /**
+     * Compute Shannon entropy (bits/byte) over [data]. Range: 0.0 (all same
+     * byte) to 8.0 (uniformly random). Used to distinguish encrypted/compressed
+     * data (typically >7.5) from plaintext media containers (typically <6.5).
+     */
+    private fun computeEntropy(data: ByteArray): Double {
+        if (data.isEmpty()) return 0.0
+        val counts = IntArray(256)
+        for (b in data) {
+            counts[b.toInt() and 0xFF]++
+        }
+        val n = data.size.toDouble()
+        var entropy = 0.0
+        for (c in counts) {
+            if (c == 0) continue
+            val p = c / n
+            entropy -= p * (Math.log(p) / Math.log(2.0))
+        }
+        return entropy
+    }
+
+    /**
      * Convenience overload: sniff a segment format from the first [bytesToRead]
      * bytes of an [inputStream]. Closes nothing; the caller owns the stream.
      *
@@ -258,6 +415,31 @@ object HlsPlaylistParser {
 
     fun parseMediaPlaylist(content: String, baseUrl: String): HlsMediaPlaylist {
         val lines = stripBom(content).lines()
+
+        // === Guard: detect master playlist being fed as media playlist ===
+        // Some non-standard HLS sources (notably certain plugin-provided
+        // StreamingCommunity URLs) expose a sub-master playlist URL where a
+        // media playlist URL is expected. If we naively parse a sub-master
+        // with parseMediaPlaylist(), every #EXT-X-STREAM-INF line is skipped
+        // (starts with '#') and the variant URL on the next line is treated
+        // as a media segment — which means we end up downloading .m3u8 files
+        // AS IF they were video segments, producing a garbage .ts file that
+        // MediaExtractor/ffmpeg cannot identify.
+        //
+        // Per HLS spec (RFC 8216 §4.3.4), a master playlist contains
+        // #EXT-X-STREAM-INF and/or #EXT-X-MEDIA; a media playlist contains
+        // #EXTINF and segment URIs. The two are mutually exclusive.
+        val hasStreamInf = lines.any { it.trim().startsWith("#EXT-X-STREAM-INF", ignoreCase = true) }
+        val hasExtInf = lines.any { it.trim().startsWith("#EXTINF", ignoreCase = true) }
+        if (hasStreamInf && !hasExtInf) {
+            error(
+                "parseMediaPlaylist() was called on a master playlist (contains #EXT-X-STREAM-INF but no #EXTINF). " +
+                    "The variant URL provided is a sub-master, not a media playlist. " +
+                    "The HLS selection sheet should expose the actual media playlist URLs, " +
+                    "or the parser should be called recursively until a media playlist is reached.",
+            )
+        }
+
         val segments = mutableListOf<HlsSegment>()
         var targetDuration = 0.0
         var currentDuration = 0.0
@@ -268,15 +450,21 @@ object HlsPlaylistParser {
 
         for (line in lines) {
             val trimmed = line.trim()
+            // === Case-insensitive tag matching ===
+            // Per RFC 8216 §4.2, HLS tags are case-sensitive (#EXT-X-KEY, not
+            // #ext-x-key). However, some non-standard packagers emit lowercase
+            // or mixed-case tags. We accept them for robustness, since rejecting
+            // a playlist because of case differences would silently fall back
+            // to "no encryption detected" and produce a garbled output file.
             when {
-                trimmed.startsWith("#EXT-X-TARGETDURATION:") -> {
+                trimmed.startsWith("#EXT-X-TARGETDURATION:", ignoreCase = true) -> {
                     targetDuration = trimmed.substringAfter(":").trim().toDoubleOrNull() ?: 0.0
                 }
-                trimmed.startsWith("#EXT-X-MEDIA-SEQUENCE:") -> {
+                trimmed.startsWith("#EXT-X-MEDIA-SEQUENCE:", ignoreCase = true) -> {
                     mediaSequence = trimmed.substringAfter(":").trim().toLongOrNull() ?: 0L
                 }
-                trimmed.startsWith("#EXT-X-KEY:") -> {
-                    val attrs = parseAttributes(trimmed.removePrefix("#EXT-X-KEY:"))
+                trimmed.startsWith("#EXT-X-KEY:", ignoreCase = true) -> {
+                    val attrs = parseAttributes(trimmed.substringAfter(":"))
                     val method = attrs["METHOD"]?.trim()?.uppercase() ?: ""
                     // METHOD=NONE explicitly disables encryption for the segments
                     // that follow, per HLS spec.
@@ -297,19 +485,20 @@ object HlsPlaylistParser {
                         )
                     }
                 }
-                trimmed.startsWith("#EXT-X-MAP:") -> {
+                trimmed.startsWith("#EXT-X-MAP:", ignoreCase = true) -> {
                     // #EXT-X-MAP:URI="init.mp4" or #EXT-X-MAP:URI="init.mp4",BYTERANGE="..."
                     // The init segment (ftyp+moov boxes) for fMP4-based HLS streams.
-                    val mapAttrs = parseAttributes(trimmed.removePrefix("#EXT-X-MAP:"))
+                    val mapAttrs = parseAttributes(trimmed.substringAfter(":"))
                     val rawMapUri = mapAttrs["URI"]?.trim()?.let { removeQuotes(it) }
                     if (rawMapUri != null) {
                         initSegmentUri = resolveUrl(rawMapUri, baseUrl)
                     }
                 }
-                trimmed.startsWith("#EXT-X-DISCONTINUITY") && !trimmed.startsWith("#EXT-X-DISCONTINUITY-SEQUENCE") -> {
+                trimmed.startsWith("#EXT-X-DISCONTINUITY", ignoreCase = true) &&
+                    !trimmed.startsWith("#EXT-X-DISCONTINUITY-SEQUENCE", ignoreCase = true) -> {
                     pendingDiscontinuity = true
                 }
-                trimmed.startsWith("#EXTINF:") -> {
+                trimmed.startsWith("#EXTINF:", ignoreCase = true) -> {
                     val durationStr = trimmed.substringAfter(":").substringBefore(",").trim()
                     currentDuration = durationStr.toDoubleOrNull() ?: 0.0
                 }

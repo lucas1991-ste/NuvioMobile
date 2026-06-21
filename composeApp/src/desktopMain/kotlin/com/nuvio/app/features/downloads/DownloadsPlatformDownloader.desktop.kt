@@ -125,9 +125,18 @@ internal actual object DownloadsPlatformDownloader {
             // 1. Fetch + parse video playlist
             val videoPlaylistContent = fetchUrlAsString(request.video.playlistUrl, request.sourceHeaders)
                 ?: error("Failed to fetch video playlist")
-            val videoPlaylist = HlsPlaylistParser.parseMediaPlaylist(
-                videoPlaylistContent, request.video.playlistUrl,
-            )
+            val videoPlaylist = try {
+                HlsPlaylistParser.parseMediaPlaylist(
+                    videoPlaylistContent, request.video.playlistUrl,
+                )
+            } catch (e: Exception) {
+                error(
+                    "Failed to parse video playlist: ${e.message}. " +
+                        "Playlist URL: ${request.video.playlistUrl}. " +
+                        "First 500 chars of playlist content: " +
+                        videoPlaylistContent.take(500).replace('\n', ' ').replace('\r', ' '),
+                )
+            }
             if (videoPlaylist.segments.isEmpty()) error("Empty video playlist")
             validateEncryptionDesktop(videoPlaylist.encryption)
 
@@ -240,6 +249,7 @@ internal actual object DownloadsPlatformDownloader {
                 )
             }
             val videoSniff = sniffFileFormatDesktop(videoTs)
+            val videoHeader4k = readFileHeadDesktop(videoTs, 4096)
             when (videoSniff) {
                 "html" -> error(
                     "Video segment file appears to be HTML, not media data. " +
@@ -258,9 +268,31 @@ internal actual object DownloadsPlatformDownloader {
                         )
                     }
                 }
-                "ts", "unknown" -> {
-                    // ffmpeg is robust enough to handle MPEG-TS and will produce its
-                    // own clear error if the format is genuinely unsupported.
+                "ts" -> {
+                    // ffmpeg is robust enough to handle MPEG-TS natively.
+                }
+                "unknown" -> {
+                    // === DEEP SCAN: identify the actual format from the first 4KB ===
+                    val deepScan = if (videoHeader4k.isNotEmpty()) {
+                        HlsPlaylistParser.deepScanFormat(videoHeader4k)
+                    } else {
+                        "unable to read file header"
+                    }
+                    if (deepScan.contains("PLAYLIST WAS DOWNLOADED AS A SEGMENT")) {
+                        error(
+                            "Video segment file is actually an HLS playlist, not media data. " +
+                                "Deep scan: $deepScan",
+                        )
+                    }
+                    if (deepScan.contains("High entropy")) {
+                        error(
+                            "Video segment file appears to be encrypted ciphertext. " +
+                                "Deep scan: $deepScan. " +
+                                "Check whether the playlist contains #EXT-X-KEY — if not, the CDN may be " +
+                                "applying its own encryption layer that the downloader does not handle.",
+                        )
+                    }
+                    // For other unknowns, let ffmpeg try; the error will include the deep scan.
                 }
             }
 
@@ -352,10 +384,16 @@ internal actual object DownloadsPlatformDownloader {
                 // doesn't have to dig through ffmpeg's stderr to figure out the
                 // root cause (ffmpeg typically says "Invalid data found when
                 // processing input" which is too generic to be actionable).
+                val deepScanInfo = if (videoSniff == "unknown" && videoHeader4k.isNotEmpty()) {
+                    HlsPlaylistParser.deepScanFormat(videoHeader4k)
+                } else {
+                    "sniff=$videoSniff (deep scan skipped)"
+                }
                 error(
                     "ffmpeg failed (exit=$exitCode, videoFormat=$videoSniff, " +
                         "videoBytes=${videoTs.length()}, audioInputs=${audioTsFiles.size}, " +
                         "initSegment=${videoInitFile != null}). " +
+                        "Deep scan: $deepScanInfo. " +
                         "Last 2000 bytes of ffmpeg log:\n" + outputLog.takeLast(2000),
                 )
             }
@@ -615,6 +653,23 @@ internal actual object DownloadsPlatformDownloader {
             }
         } catch (_: Exception) {
             "unknown"
+        }
+    }
+
+    /**
+     * Read the first [maxBytes] of [file] as a raw byte array, for deep scan.
+     * Returns an empty array if the file cannot be read.
+     */
+    private fun readFileHeadDesktop(file: File, maxBytes: Int): ByteArray {
+        if (!file.exists() || file.length() == 0L) return ByteArray(0)
+        return try {
+            file.inputStream().use { input ->
+                val buf = ByteArray(maxBytes.coerceAtLeast(1))
+                val read = input.read(buf)
+                if (read <= 0) ByteArray(0) else if (read == buf.size) buf else buf.copyOf(read)
+            }
+        } catch (_: Exception) {
+            ByteArray(0)
         }
     }
 
