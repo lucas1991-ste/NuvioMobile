@@ -487,16 +487,135 @@ object HlsPlaylistParser {
     private fun removeQuotes(value: String): String =
         value.trim().removeSurrounding("\"")
 
+    /**
+     * Resolve a possibly-relative HLS URI against a base URL.
+     *
+     * Handles the common cases that real-world HLS deployments use:
+     *   - Absolute http(s) URL -> returned as-is
+     *   - Protocol-relative URL (//host/path) -> upgraded to https://
+     *   - Root-relative URL (/path) -> joined with the base's scheme+host
+     *   - Path-relative URL (path or ./path or ../path) -> joined with the
+     *     base's directory
+     *
+     * Crucially, when the base URL carries a query string (typical of signed
+     * CDN URLs like https://cdn.example.com/manifest/master.m3u8?token=abc&exp=123)
+     * the query string is preserved and merged with the relative URI's own
+     * query string (base keys first, then relative keys override).
+     *
+     * The fragment of the base URL is dropped (HLS does not use it).
+     */
     fun resolveUrl(relative: String, baseUrl: String): String {
         val trimmed = relative.trim()
+        if (trimmed.isEmpty()) return trimmed
+
+        // Absolute URL: returned as-is, no merging needed.
         if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) return trimmed
-        if (trimmed.isBlank()) return trimmed
-        val base = baseUrl.trimEnd('/')
-        val basePath = if (base.contains('/')) {
-            base.substringBeforeLast('/')
-        } else {
-            base
+
+        // Protocol-relative URL: pick scheme from base.
+        if (trimmed.startsWith("//")) {
+            val scheme = if (baseUrl.startsWith("https://")) "https:" else "http:"
+            return scheme + trimmed
         }
-        return "$basePath/$trimmed"
+
+        // Parse the base URL into (scheme, host, path, query).
+        val (baseScheme, baseRest) = if (baseUrl.startsWith("https://")) {
+            "https://" to baseUrl.removePrefix("https://")
+        } else if (baseUrl.startsWith("http://")) {
+            "http://" to baseUrl.removePrefix("http://")
+        } else {
+            return trimmed
+        }
+
+        // Split authority+path from query at the first '?'
+        val questionIdx = baseRest.indexOf('?')
+        val baseAuthorityAndPath: String
+        val baseQuery: String?
+        if (questionIdx >= 0) {
+            baseAuthorityAndPath = baseRest.substring(0, questionIdx)
+            baseQuery = baseRest.substring(questionIdx + 1)
+        } else {
+            baseAuthorityAndPath = baseRest
+            baseQuery = null
+        }
+
+        // Split authority from path at the first '/'.
+        val slashIdx = baseAuthorityAndPath.indexOf('/')
+        val authority: String
+        val basePath: String
+        if (slashIdx >= 0) {
+            authority = baseAuthorityAndPath.substring(0, slashIdx)
+            basePath = baseAuthorityAndPath.substring(slashIdx)
+        } else {
+            authority = baseAuthorityAndPath
+            basePath = ""
+        }
+
+        // Split the relative URI into path + query.
+        val (relPath, relQuery) = if ('?' in trimmed) {
+            val idx = trimmed.indexOf('?')
+            trimmed.substring(0, idx) to trimmed.substring(idx + 1)
+        } else {
+            trimmed to null
+        }
+
+        // Compute the new path.
+        val newPath: String = when {
+            relPath.startsWith("/") -> relPath // root-relative
+            relPath.startsWith("../") -> {
+                // Walk up one directory at a time from the base path.
+                var work = basePath
+                var pending = relPath
+                while (pending.startsWith("../")) {
+                    work = work.trimEnd('/').substringBeforeLast('/', "")
+                    pending = pending.removePrefix("../")
+                }
+                work + "/" + pending
+            }
+            relPath.startsWith("./") -> {
+                // "./foo" = "foo" in the same directory as the base file.
+                val baseDir = basePath.substringBeforeLast('/', "")
+                val rest = relPath.removePrefix("./")
+                if (baseDir.isEmpty()) "/$rest" else "$baseDir/$rest"
+            }
+            else -> {
+                // Path-relative: take base's directory (everything before last '/').
+                val baseDir = if (basePath.contains('/')) basePath.substringBeforeLast('/') else ""
+                if (baseDir.isEmpty()) "/$relPath" else "$baseDir/$relPath"
+            }
+        }
+
+        // Merge query strings: base first, then relative overrides.
+        val mergedQuery = mergeQuery(baseQuery, relQuery)
+        val queryString = if (mergedQuery.isNotEmpty()) "?$mergedQuery" else ""
+
+        return "$baseScheme$authority$newPath$queryString"
+    }
+
+    /**
+     * Merge two URL-encoded query strings. Keys from [base] come first; if a
+     * key also appears in [override], the override's value wins and is moved
+     * to the position of the base entry (so the merge is stable w.r.t. order).
+     * Keys present only in [override] are appended at the end.
+     */
+    private fun mergeQuery(base: String?, override: String?): String {
+        if (base.isNullOrBlank() && override.isNullOrBlank()) return ""
+        if (base.isNullOrBlank()) return override ?: ""
+        if (override.isNullOrBlank()) return base
+
+        val order = mutableListOf<String>()
+        val values = mutableMapOf<String, String>()
+
+        for (q in listOf(base, override)) {
+            q.split('&').forEach { pair ->
+                if (pair.isEmpty()) return@forEach
+                val eq = pair.indexOf('=')
+                val key = if (eq >= 0) pair.substring(0, eq) else pair
+                val value = if (eq >= 0) pair.substring(eq + 1) else ""
+                if (!order.contains(key)) order.add(key)
+                values[key] = value
+            }
+        }
+
+        return order.joinToString("&") { key -> "$key=${values[key]}" }
     }
 }

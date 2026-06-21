@@ -221,10 +221,18 @@ internal actual object DownloadsPlatformDownloader {
             cmd += "-map"
             cmd += "0:v"
 
-            // Map audio (one per input audio file)
-            audioTsFiles.forEachIndexed { idx, _ ->
+            if (audioTsFiles.isEmpty()) {
+                // No separate audio tracks: the audio is multiplexed inside
+                // the video .ts. Map all audio tracks from input 0 so ffmpeg
+                // includes them in the output MP4.
                 cmd += "-map"
-                cmd += "${idx + 1}:a"
+                cmd += "0:a?"
+            } else {
+                // Map audio (one per input audio file)
+                audioTsFiles.forEachIndexed { idx, _ ->
+                    cmd += "-map"
+                    cmd += "${idx + 1}:a"
+                }
             }
 
             // Map subtitles (one per subtitle file)

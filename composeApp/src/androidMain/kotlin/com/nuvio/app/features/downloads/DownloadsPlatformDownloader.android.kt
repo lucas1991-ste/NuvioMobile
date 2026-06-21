@@ -625,13 +625,25 @@ internal actual object DownloadsPlatformDownloader {
         videoExtractor.setDataSource(videoTs.absolutePath)
 
         var videoTrackIndex = -1
+        // When the master playlist has no separate audio variants, the audio
+        // is multiplexed inside the video segments (.ts contains both video
+        // and audio tracks). We detect and extract those embedded audio tracks
+        // here so the resulting MP4 is not silent.
+        val embeddedAudioTrackIndices = mutableListOf<Int>()
         for (i in 0 until videoExtractor.trackCount) {
             val format = videoExtractor.getTrackFormat(i)
             val mime = format.getString(MediaFormat.KEY_MIME) ?: continue
-            if (mime.startsWith("video/")) {
-                videoTrackIndex = i
-                videoExtractor.selectTrack(i)
-                break
+            when {
+                mime.startsWith("video/") && videoTrackIndex == -1 -> {
+                    videoTrackIndex = i
+                    videoExtractor.selectTrack(i)
+                }
+                mime.startsWith("audio/") && audioTsFiles.isEmpty() -> {
+                    // Only harvest embedded audio when no separate audio files
+                    // were downloaded. Otherwise we'd duplicate the audio.
+                    embeddedAudioTrackIndices.add(i)
+                    videoExtractor.selectTrack(i)
+                }
             }
         }
         if (videoTrackIndex == -1) {
@@ -669,7 +681,9 @@ internal actual object DownloadsPlatformDownloader {
             )
 
             val videoOutTrack = muxer.addTrack(videoExtractor.getTrackFormat(videoTrackIndex))
-            val audioOutTracks = audioExtractors.mapIndexed { idx, ext ->
+
+            // External audio tracks (one per separate .ts file).
+            val externalAudioOutTracks = audioExtractors.mapIndexed { idx, ext ->
                 val format = ext.getTrackFormat(audioTrackIndices[idx])
                 audioTracks.getOrNull(idx)?.language?.takeIf { it.isNotBlank() }?.let { lang ->
                     format.setString(MediaFormat.KEY_LANGUAGE, lang)
@@ -677,12 +691,21 @@ internal actual object DownloadsPlatformDownloader {
                 muxer.addTrack(format)
             }
 
+            // Embedded audio tracks (harvested from the video.ts when no
+            // separate audio files were provided).
+            val embeddedAudioOutTracks = embeddedAudioTrackIndices.map { idx ->
+                muxer.addTrack(videoExtractor.getTrackFormat(idx))
+            }
+
             muxer.start()
 
             val buffer = ByteBuffer.allocateDirect(2 * 1024 * 1024)
             val bufferInfo = MediaCodec.BufferInfo()
 
-            // Video samples
+            // Video + embedded audio samples are interleaved by the extractor
+            // (MediaExtractor advances through samples of all selected tracks
+            // in presentation order). We route each sample to its destination
+            // track based on which track the extractor is currently at.
             while (true) {
                 buffer.clear()
                 val size = videoExtractor.readSampleData(buffer, 0)
@@ -691,13 +714,23 @@ internal actual object DownloadsPlatformDownloader {
                 bufferInfo.size = size
                 bufferInfo.flags = videoExtractor.sampleFlags
                 bufferInfo.presentationTimeUs = videoExtractor.sampleTime
-                muxer.writeSampleData(videoOutTrack, buffer, bufferInfo)
+                val currentTrack = videoExtractor.sampleTrackIndex
+                when (currentTrack) {
+                    videoTrackIndex -> muxer.writeSampleData(videoOutTrack, buffer, bufferInfo)
+                    else -> {
+                        val embeddedPos = embeddedAudioTrackIndices.indexOf(currentTrack)
+                        if (embeddedPos >= 0) {
+                            muxer.writeSampleData(embeddedAudioOutTracks[embeddedPos], buffer, bufferInfo)
+                        }
+                        // Samples from any other (unselected) track are dropped.
+                    }
+                }
                 videoExtractor.advance()
             }
 
-            // Audio samples (each track sequentially)
+            // External audio samples (each track sequentially).
             audioExtractors.forEachIndexed { idx, ext ->
-                val outTrack = audioOutTracks[idx]
+                val outTrack = externalAudioOutTracks[idx]
                 while (true) {
                     buffer.clear()
                     val size = ext.readSampleData(buffer, 0)

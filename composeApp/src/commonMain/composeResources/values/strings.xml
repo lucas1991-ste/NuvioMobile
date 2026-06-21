@@ -1597,7 +1597,7 @@
     <string name="downloads_hls_select_variant">Select quality, audio and subtitles</string>
     <string name="downloads_hls_audio_hint">Tap to toggle. Select one or more audio tracks.</string>
     <string name="downloads_hls_subtitle_hint">Tap to toggle. Choose which subtitle languages to embed.</string>
-    <string name="downloads_hls_no_audio">No audio tracks available</string>
+    <string name="downloads_hls_no_audio">Audio is embedded in the video stream (no separate language tracks).</string>
     <string name="downloads_hls_no_subtitles">No subtitles available</string>
     <string name="downloads_error_hls_encrypted">Cannot download: stream is encrypted with an unsupported method</string>
     <string name="downloads_error_hls_drm">Cannot download: stream uses a proprietary DRM system (FairPlay / Widevine / PlayReady)</string>
