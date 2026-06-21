@@ -1,11 +1,11 @@
 package com.nuvio.app.features.downloads
 
 import android.content.Context
-import android.media.MediaCodec
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.net.Uri
 import androidx.documentfile.provider.DocumentFile
+import androidx.media3.common.BufferInfo
 import androidx.media3.common.Format
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.muxer.Mp4Muxer
@@ -1047,7 +1047,6 @@ internal actual object DownloadsPlatformDownloader {
             }
 
             val buffer = ByteBuffer.allocateDirect(2 * 1024 * 1024)
-            val bufferInfo = MediaCodec.BufferInfo()
 
             // === Per-track sample counters (for diagnostics at close()) ===
             var videoSampleCount = 0L
@@ -1066,13 +1065,18 @@ internal actual object DownloadsPlatformDownloader {
             // (MediaExtractor advances through samples of all selected tracks
             // in presentation order). We route each sample to its destination
             // track based on which track the extractor is currently at.
+            //
+            // Note: media3's BufferInfo is immutable and created via the
+            // BufferInfo.create() factory method (unlike android.media.MediaCodec
+            // .BufferInfo which has mutable fields). The int flags returned by
+            // MediaExtractor.getSampleFlags() use the same values as media3's
+            // BUFFER_FLAG_* constants (1=key_frame, 2=codec_config, 4=eos),
+            // so they can be passed through directly.
             while (true) {
                 buffer.clear()
                 val size = vExtractor.readSampleData(buffer, 0)
                 if (size < 0) break
-                bufferInfo.offset = 0
-                bufferInfo.size = size
-                bufferInfo.flags = vExtractor.sampleFlags
+                val flags = vExtractor.sampleFlags
                 var pts = vExtractor.sampleTime
                 val currentTrack = vExtractor.sampleTrackIndex
                 when (currentTrack) {
@@ -1080,8 +1084,11 @@ internal actual object DownloadsPlatformDownloader {
                         // Enforce monotonic PTS (clamp if regression).
                         if (pts < lastVideoPts) pts = lastVideoPts
                         lastVideoPts = pts
-                        bufferInfo.presentationTimeUs = pts
-                        muxer.writeSampleData(videoOutToken, buffer, bufferInfo)
+                        muxer.writeSampleData(
+                            videoOutToken,
+                            buffer,
+                            BufferInfo.create(0, size, pts, flags),
+                        )
                         videoSampleCount++
                     }
                     else -> {
@@ -1089,8 +1096,11 @@ internal actual object DownloadsPlatformDownloader {
                         if (embeddedPos >= 0) {
                             if (pts < lastEmbeddedPts[embeddedPos]) pts = lastEmbeddedPts[embeddedPos]
                             lastEmbeddedPts[embeddedPos] = pts
-                            bufferInfo.presentationTimeUs = pts
-                            muxer.writeSampleData(embeddedAudioTokens[embeddedPos], buffer, bufferInfo)
+                            muxer.writeSampleData(
+                                embeddedAudioTokens[embeddedPos],
+                                buffer,
+                                BufferInfo.create(0, size, pts, flags),
+                            )
                             embeddedAudioSampleCounts[embeddedPos]++
                         }
                         // Samples from any other (unselected) track are dropped.
@@ -1106,14 +1116,15 @@ internal actual object DownloadsPlatformDownloader {
                     buffer.clear()
                     val size = ext.readSampleData(buffer, 0)
                     if (size < 0) break
-                    bufferInfo.offset = 0
-                    bufferInfo.size = size
-                    bufferInfo.flags = ext.sampleFlags
+                    val flags = ext.sampleFlags
                     var pts = ext.sampleTime
                     if (pts < lastExternalPts[idx]) pts = lastExternalPts[idx]
                     lastExternalPts[idx] = pts
-                    bufferInfo.presentationTimeUs = pts
-                    muxer.writeSampleData(token, buffer, bufferInfo)
+                    muxer.writeSampleData(
+                        token,
+                        buffer,
+                        BufferInfo.create(0, size, pts, flags),
+                    )
                     externalAudioSampleCounts[idx]++
                     ext.advance()
                 }
@@ -1186,31 +1197,25 @@ internal actual object DownloadsPlatformDownloader {
      * Convert an `android.media.MediaFormat` (returned by `MediaExtractor`) into
      * an `androidx.media3.common.Format` (consumed by `Mp4Muxer.addTrack`).
      *
-     * We only copy the fields that matter for muxing: mime type, duration,
-     * language, and codec-specific dimensions (width/height/frame-rate for
-     * video, channel-count/sample-rate for audio). All other MediaFormat keys
-     * (CSD-0, CSD-1, max-input-size, ...) are either handled internally by
-     * `MediaExtractor.readSampleData` (which prepends CSD bytes as samples with
-     * the BUFFER_FLAG_CODEC_CONFIG flag) or are not needed by `Mp4Muxer`.
+     * We only copy the fields that matter for muxing: mime type, language, and
+     * codec-specific dimensions (width/height/frame-rate for video,
+     * channel-count/sample-rate for audio). All other MediaFormat keys
+     * (CSD-0, CSD-1, max-input-size, KEY_DURATION, ...) are either handled
+     * internally by `MediaExtractor.readSampleData` (which prepends CSD bytes
+     * as samples with the BUFFER_FLAG_CODEC_CONFIG flag) or are not needed by
+     * `Mp4Muxer` — in particular, media3's `Format.Builder` does NOT expose
+     * `setDurationUs()`; the duration is computed automatically by the muxer
+     * from the last written sample's PTS.
      *
-     * If the input MediaFormat has a bogus duration (negative or > 24h), it is
-     * clamped to 0 via [sanitizeMediaFormatDuration] before this function is
-     * called.
+     * If the input MediaFormat has a bogus duration (negative or > 24h), it
+     * has already been clamped to 0 by [sanitizeMediaFormatDuration] before
+     * this function is called.
      */
     @OptIn(UnstableApi::class)
     private fun toMedia3Format(mediaFormat: MediaFormat): Format {
         val builder = Format.Builder()
         val mime = mediaFormat.getString(MediaFormat.KEY_MIME) ?: ""
         builder.setSampleMimeType(mime)
-
-        if (mediaFormat.containsKey(MediaFormat.KEY_DURATION)) {
-            val dur = mediaFormat.getLong(MediaFormat.KEY_DURATION)
-            // Duration already sanitized by sanitizeMediaFormatDuration(), but
-            // double-check here in case this function is called directly.
-            if (dur in 0..86_400_000_000L) {
-                builder.setDurationUs(dur)
-            }
-        }
 
         mediaFormat.getString(MediaFormat.KEY_LANGUAGE)?.takeIf { it.isNotBlank() }?.let {
             builder.setLanguage(it)
