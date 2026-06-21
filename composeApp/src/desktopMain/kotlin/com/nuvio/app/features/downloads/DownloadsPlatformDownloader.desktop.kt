@@ -161,7 +161,16 @@ internal actual object DownloadsPlatformDownloader {
 
             // 4. Download segments
             var totalDownloaded = 0L
-            val videoTs = File(workDir, "video.ts")
+
+            // For fMP4-based HLS, download the init segment (ftyp+moov) and
+            // prepend it to the concatenated media segments so ffmpeg can parse
+            // the file correctly.
+            val videoInitFile = videoPlaylist.initSegmentUri?.let { initUri ->
+                val f = File(workDir, "video_init.mp4")
+                fetchInitSegmentDesktop(initUri, request.sourceHeaders, f)
+                f
+            }
+            val videoTs = File(workDir, if (videoInitFile != null) "video.mp4" else "video.ts")
             downloadSegmentsToTsFileDesktop(
                 segmentUrls = videoPlaylist.segments.map { it.url },
                 headers = request.sourceHeaders,
@@ -204,7 +213,22 @@ internal actual object DownloadsPlatformDownloader {
                 f
             }
 
-            // 5. Build ffmpeg command:
+            // 5. For fMP4 streams, prepend init segment to the media segments.
+            if (videoInitFile != null && videoInitFile.exists()) {
+                val combinedVideo = File(workDir, "video_combined.mp4")
+                videoInitFile.inputStream().use { initInput ->
+                    combinedVideo.outputStream().use { combinedOutput ->
+                        initInput.copyTo(combinedOutput)
+                        videoTs.inputStream().use { mediaInput ->
+                            mediaInput.copyTo(combinedOutput)
+                        }
+                    }
+                }
+                videoTs.delete()
+                combinedVideo.renameTo(videoTs)
+            }
+
+            // 6. Build ffmpeg command:
             //    ffmpeg -i video.ts -i audio_0.ts -i audio_1.ts -i sub_0.vtt \
             //           -map 0:v -map 1:a -map 2:a -map 3:s \
             //           -c copy -c:s mov_text \
@@ -274,7 +298,7 @@ internal actual object DownloadsPlatformDownloader {
             if (outputMp4.exists()) outputMp4.delete()
             cmd += outputMp4.absolutePath
 
-            // 6. Run ffmpeg
+            // 7. Run ffmpeg
             val processBuilder = ProcessBuilder(cmd).redirectErrorStream(true)
             val process = processBuilder.start()
 
@@ -291,7 +315,7 @@ internal actual object DownloadsPlatformDownloader {
                 error("ffmpeg failed (exit=$exitCode): ${outputLog.takeLast(2000)}")
             }
 
-            // 7. Cleanup
+            // 8. Cleanup
             workDir.deleteRecursively()
 
             val finalSize = outputMp4.length()
@@ -306,6 +330,33 @@ internal actual object DownloadsPlatformDownloader {
         val track: HlsRemuxTrack,
         val playlist: HlsMediaPlaylist,
     )
+
+    /**
+     * Download the HLS Initialization Segment (#EXT-X-MAP) for fMP4 streams.
+     * The init segment contains ftyp+moov boxes and must be prepended to the
+     * concatenated media segments for ffmpeg to parse them.
+     */
+    private fun fetchInitSegmentDesktop(
+        initUri: String,
+        headers: Map<String, String>,
+        outFile: File,
+    ) {
+        val conn = URL(initUri).openConnection() as HttpURLConnection
+        headers.forEach { (k, v) -> conn.setRequestProperty(k, v) }
+        conn.connect()
+        try {
+            if (conn.responseCode !in 200..299) {
+                error("Failed to fetch init segment: HTTP ${conn.responseCode}")
+            }
+            conn.inputStream.use { input ->
+                outFile.outputStream().use { output ->
+                    input.copyTo(output)
+                }
+            }
+        } finally {
+            conn.disconnect()
+        }
+    }
 
     private fun validateEncryptionDesktop(encryption: HlsEncryption?) {
         if (encryption == null) return

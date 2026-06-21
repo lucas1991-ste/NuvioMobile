@@ -361,9 +361,19 @@ internal actual object DownloadsPlatformDownloader {
                         TrackPlaylist(track, pl)
                     }
 
-                // 4. Download all segments into temp .ts files (and .vtt for subtitles)
+                // 4. Download all segments into temp files (and .vtt for subtitles)
                 var totalDownloaded = 0L
-                val videoTsFile = File(workDir, "video.ts")
+
+                // For fMP4-based HLS, the init segment (ftyp+moov) must be
+                // prepended to the concatenated media segments so that
+                // MediaExtractor can parse the result. For MPEG-TS streams
+                // there is no init segment and concatenation is sufficient.
+                val videoInitFile = videoPlaylist.initSegmentUri?.let { initUri ->
+                    val f = File(workDir, "video_init.mp4")
+                    fetchInitSegment(initUri, request.sourceHeaders, f)
+                    f
+                }
+                val videoTsFile = File(workDir, if (videoInitFile != null) "video.mp4" else "video.ts")
                 downloadSegmentsToTsFile(
                     segmentUrls = videoPlaylist.segments.map { it.url },
                     headers = request.sourceHeaders,
@@ -409,7 +419,25 @@ internal actual object DownloadsPlatformDownloader {
                     f
                 }
 
-                // 5. Remux video + audio into MP4 via MediaMuxer
+                // 5. For fMP4 streams, prepend the init segment to the
+                //    concatenated media segments so that MediaExtractor can
+                //    parse the file. Without the init segment (ftyp+moov),
+                //    MediaExtractor throws "Failed to instantiate extractor".
+                if (videoInitFile != null && videoInitFile.exists()) {
+                    val combinedVideo = File(workDir, "video_combined.mp4")
+                    videoInitFile.inputStream().use { initInput ->
+                        combinedVideo.outputStream().use { combinedOutput ->
+                            initInput.copyTo(combinedOutput)
+                            videoTsFile.inputStream().use { mediaInput ->
+                                mediaInput.copyTo(combinedOutput)
+                            }
+                        }
+                    }
+                    videoTsFile.delete()
+                    combinedVideo.renameTo(videoTsFile)
+                }
+
+                // 6. Remux video + audio into MP4 via MediaMuxer
                 val tempMp4 = File(workDir, "output.mp4")
                 remuxToMp4(
                     videoTs = videoTsFile,
@@ -418,7 +446,7 @@ internal actual object DownloadsPlatformDownloader {
                     outputMp4 = tempMp4,
                 )
 
-                // 6. Copy MP4 to destination
+                // 7. Copy MP4 to destination
                 if (destination.exists()) destination.delete()
                 tempMp4.inputStream().use { input ->
                     destination.openOutputStream(false).use { output ->
@@ -426,7 +454,7 @@ internal actual object DownloadsPlatformDownloader {
                     }
                 }
 
-                // 7. Copy subtitle sidecar files (.vtt) next to the MP4
+                // 8. Copy subtitle sidecar files (.vtt) next to the MP4
                 // Android MediaMuxer does not support mov_text subtitle tracks in MP4 output,
                 // so subtitles are saved as sidecar WebVTT files. ExoPlayer auto-loads them
                 // when they share the same base filename (e.g. "movie.mp4" + "movie.it.vtt").
@@ -452,7 +480,7 @@ internal actual object DownloadsPlatformDownloader {
                     }
                 }
 
-                // 8. Cleanup temp dir
+                // 9. Cleanup temp dir
                 workDir.deleteRecursively()
 
                 val finalSize = destination.length()
@@ -471,6 +499,31 @@ internal actual object DownloadsPlatformDownloader {
         val track: HlsRemuxTrack,
         val playlist: HlsMediaPlaylist,
     )
+
+    /**
+     * Download the HLS Initialization Segment (#EXT-X-MAP) and write it to
+     * [outFile]. The init segment contains the `ftyp` + `moov` boxes that
+     * describe the track structure of an fMP4 stream and MUST be prepended
+     * to the concatenated media segments for MediaExtractor to parse them.
+     */
+    private fun fetchInitSegment(
+        initUri: String,
+        headers: Map<String, String>,
+        outFile: File,
+    ) {
+        val requestBuilder = Request.Builder().url(initUri)
+        headers.forEach { (k, v) -> requestBuilder.header(k, v) }
+        val response = downloadHttpClient.newCall(requestBuilder.get().build()).execute()
+        response.use { resp ->
+            if (!resp.isSuccessful) {
+                error("Failed to fetch init segment: HTTP ${resp.code}")
+            }
+            val body = resp.body ?: error("Empty init segment response body")
+            outFile.outputStream().use { output ->
+                output.write(body.bytes())
+            }
+        }
+    }
 
     /**
      * Reject playlists that cannot be downloaded. AES-128 with http(s)/data: URI

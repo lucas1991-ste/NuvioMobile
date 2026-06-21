@@ -29,6 +29,16 @@ data class HlsMediaPlaylist(
     val isEncrypted: Boolean = false,
     val encryption: HlsEncryption? = null,
     val mediaSequence: Long = 0L,
+    /**
+     * The URI of the Initialization Segment (from `#EXT-X-MAP`).
+     *
+     * Present in fMP4-based HLS streams. The init segment contains the `ftyp`
+     * and `moov` boxes that describe the track structure, and MUST be prepended
+     * to the concatenated media segments for `MediaExtractor` / `ffmpeg` to
+     * parse the result. When null, the stream uses MPEG-TS segments that are
+     * self-describing and can be concatenated directly.
+     */
+    val initSegmentUri: String? = null,
 )
 
 /**
@@ -186,6 +196,7 @@ object HlsPlaylistParser {
         var pendingDiscontinuity = false
         var currentEncryption: HlsEncryption? = null
         var mediaSequence = 0L
+        var initSegmentUri: String? = null
 
         for (line in lines) {
             val trimmed = line.trim()
@@ -218,6 +229,15 @@ object HlsPlaylistParser {
                         )
                     }
                 }
+                trimmed.startsWith("#EXT-X-MAP:") -> {
+                    // #EXT-X-MAP:URI="init.mp4" or #EXT-X-MAP:URI="init.mp4",BYTERANGE="..."
+                    // The init segment (ftyp+moov boxes) for fMP4-based HLS streams.
+                    val mapAttrs = parseAttributes(trimmed.removePrefix("#EXT-X-MAP:"))
+                    val rawMapUri = mapAttrs["URI"]?.trim()?.let { removeQuotes(it) }
+                    if (rawMapUri != null) {
+                        initSegmentUri = resolveUrl(rawMapUri, baseUrl)
+                    }
+                }
                 trimmed.startsWith("#EXT-X-DISCONTINUITY") && !trimmed.startsWith("#EXT-X-DISCONTINUITY-SEQUENCE") -> {
                     pendingDiscontinuity = true
                 }
@@ -247,6 +267,7 @@ object HlsPlaylistParser {
             isEncrypted = isEncrypted,
             encryption = currentEncryption,
             mediaSequence = mediaSequence,
+            initSegmentUri = initSegmentUri,
         )
     }
 
