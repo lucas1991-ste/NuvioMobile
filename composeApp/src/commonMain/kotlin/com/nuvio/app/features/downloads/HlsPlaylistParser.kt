@@ -260,8 +260,9 @@ object HlsPlaylistParser {
     private fun parseIv(value: String): ByteArray? {
         val cleaned = value.trim().removePrefix("0x").removePrefix("0X")
         if (cleaned.length != 32) return null
-        if (!cleaned.all { it.isDigit() || it.lower() in 'a'..'f' }) return null
-        return cleaned.chunked(2) { byteStr ->
+        val lower = cleaned.lowercase()
+        if (!lower.all { it.isDigit() || it in 'a'..'f' }) return null
+        return lower.chunked(2) { byteStr ->
             byteStr.toString().toInt(16).toByte()
         }.toByteArray()
     }
