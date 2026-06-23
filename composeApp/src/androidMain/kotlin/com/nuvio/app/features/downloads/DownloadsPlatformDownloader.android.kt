@@ -1038,16 +1038,28 @@ internal actual object DownloadsPlatformDownloader {
             // - MediaExtractor.getSampleFlags() returns int values that happen
             //   to match media3's C.BUFFER_FLAG_* constants (1=key_frame,
             //   2=codec_config, 4=eos, 8=partial_frame), so we pass them through.
+            //
+            // === CSD probing ===
+            // MediaExtractor does NOT populate "csd-0"/"csd-1" in the video
+            // track's MediaFormat until it has read at least one keyframe.
+            // For TS files, the SPS/PPS are embedded inside the first keyframe
+            // access unit, not in the PMT. So getTrackFormat() called right
+            // after setDataSource() returns a Format with NO CSD, and
+            // Mp4Muxer fails at addTrack with
+            //   "csd-0 and/or csd-1 not found in the format for avcC box".
+            // Fix: probe the extractor by reading samples until we hit a
+            // keyframe, then grab the Format (which now has CSD), then seek
+            // back to 0 so the main write loop starts from the beginning.
             val muxer = Mp4Muxer.Builder(FileOutputStream(outputMp4))
                 .build()
 
-            val videoFormat = vExtractor.getTrackFormat(videoTrackIndex)
+            val videoFormat = ensureCsdPopulated(vExtractor, videoTrackIndex)
             sanitizeMediaFormatDuration(videoFormat)
             val videoOutTrackId: Int = muxer.addTrack(toMedia3Format(videoFormat))
 
             // External audio tracks (one per separate .ts file).
             val externalAudioTrackIds: List<Int> = audioExtractors.mapIndexed { idx, ext ->
-                val format = ext.getTrackFormat(audioTrackIndices[idx])
+                val format = ensureCsdPopulated(ext, audioTrackIndices[idx])
                 sanitizeMediaFormatDuration(format)
                 audioTracks.getOrNull(idx)?.language?.takeIf { it.isNotBlank() }?.let { lang ->
                     format.setString(MediaFormat.KEY_LANGUAGE, lang)
@@ -1058,7 +1070,7 @@ internal actual object DownloadsPlatformDownloader {
             // Embedded audio tracks (only those that have at least 1 sample).
             // Also sanitize duration on each.
             val embeddedAudioTrackIds: List<Int> = embeddedAudioTrackIndices.map { idx ->
-                val format = vExtractor.getTrackFormat(idx)
+                val format = ensureCsdPopulated(vExtractor, idx)
                 sanitizeMediaFormatDuration(format)
                 muxer.addTrack(toMedia3Format(format))
             }
@@ -1227,6 +1239,86 @@ internal actual object DownloadsPlatformDownloader {
             vExtractor.release()
             audioExtractors.forEach { runCatching { it.release() } }
         }
+    }
+
+    /**
+     * Ensure the `csd-0`/`csd-1` codec-specific data is populated in the
+     * MediaFormat returned by [MediaExtractor.getTrackFormat] for [trackIdx].
+     *
+     * Background: MediaExtractor on Android does NOT extract CSD (SPS/PPS for
+     * H.264, VPS+SPS+PPS for HEVC, AudioSpecificConfig for AAC, ...) at
+     * `setDataSource()` time. For TS files, the CSD is embedded inside the
+     * first keyframe access unit, and MediaExtractor only parses it when
+     * `readSampleData()` reads that keyframe. As a result, calling
+     * `getTrackFormat()` immediately after `setDataSource()` returns a
+     * MediaFormat WITHOUT csd-0/csd-1, which causes Mp4Muxer.addTrack() to
+     * fail with:
+     *
+     *     "csd-0 and/or csd-1 not found in the format for avcC box"
+     *
+     * This function probes the extractor by reading up to 100 samples (or
+     * until a keyframe on the target track is found), then returns the
+     * MediaFormat which now contains csd-0/csd-1. The extractor's read
+     * position is reset to 0 via `seekTo(0, SEEK_TO_PREVIOUS_SYNC)` so the
+     * subsequent write loop reads from the beginning.
+     *
+     * For audio tracks, the first sample (which contains the AAC ASC) is
+     * usually enough — there is no "keyframe" concept for audio, so the
+     * function just reads 1 sample.
+     *
+     * If the probe fails (no CSD after 100 samples), the function returns
+     * the Format as-is. The downstream `addTrack` call will fail with a clear
+     * error and the user will see a meaningful diagnostic.
+     */
+    private fun ensureCsdPopulated(extractor: MediaExtractor, trackIdx: Int): MediaFormat {
+        val initial = extractor.getTrackFormat(trackIdx)
+        // Fast path: CSD already present (some MediaExtractor implementations
+        // populate it eagerly, especially for fMP4 inputs).
+        if (initial.containsKey("csd-0") || initial.containsKey("csd-1")) {
+            return initial
+        }
+
+        // Slow path: probe by reading samples until we hit a keyframe on the
+        // target track. Limit to 100 samples to avoid scanning the whole file.
+        val probeBuf = ByteBuffer.allocateDirect(2 * 1024 * 1024)
+        extractor.seekTo(0, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+        var attempts = 0
+        val maxAttempts = 100
+        while (attempts < maxAttempts) {
+            probeBuf.clear()
+            val size = extractor.readSampleData(probeBuf, 0)
+            if (size < 0) break
+            val flags = extractor.sampleFlags
+            val currentTrack = extractor.sampleTrackIndex
+            extractor.advance()
+            attempts++
+            // For video: stop at first keyframe (CSD should be populated).
+            // For audio: stop at first sample (ASC is in csd-0 for AAC).
+            val isVideo = runCatching {
+                extractor.getTrackFormat(trackIdx)
+                    .getString(MediaFormat.KEY_MIME)?.startsWith("video/") == true
+            }.getOrDefault(false)
+            if (currentTrack == trackIdx) {
+                if (!isVideo || (flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0) {
+                    // Check if CSD is now present
+                    val fmt = extractor.getTrackFormat(trackIdx)
+                    if (fmt.containsKey("csd-0") || fmt.containsKey("csd-1")) {
+                        // CSD found — reset position and return
+                        extractor.seekTo(0, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+                        return fmt
+                    }
+                    if (!isVideo) {
+                        // Audio with no CSD after first few samples — give up
+                        // probing and let downstream code handle the missing CSD.
+                        if (attempts >= 5) break
+                    }
+                }
+            }
+        }
+
+        // Reset to start before returning
+        extractor.seekTo(0, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+        return extractor.getTrackFormat(trackIdx)
     }
 
     /**
