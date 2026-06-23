@@ -1040,39 +1040,54 @@ internal actual object DownloadsPlatformDownloader {
             //   2=codec_config, 4=eos, 8=partial_frame), so we pass them through.
             //
             // === CSD probing ===
-            // MediaExtractor does NOT populate "csd-0"/"csd-1" in the video
-            // track's MediaFormat until it has read at least one keyframe.
-            // For TS files, the SPS/PPS are embedded inside the first keyframe
-            // access unit, not in the PMT. So getTrackFormat() called right
-            // after setDataSource() returns a Format with NO CSD, and
-            // Mp4Muxer fails at addTrack with
-            //   "csd-0 and/or csd-1 not found in the format for avcC box".
-            // Fix: probe the extractor by reading samples until we hit a
-            // keyframe, then grab the Format (which now has CSD), then seek
-            // back to 0 so the main write loop starts from the beginning.
+            // MediaExtractor does NOT always populate "csd-0"/"csd-1" in the
+            // MediaFormat for TS inputs — on some Android versions (notably
+            // Android 10 / MIUI 12) the CSD bytes are emitted only as separate
+            // samples flagged with BUFFER_FLAG_CODEC_CONFIG, and NEVER placed
+            // in the MediaFormat's csd-0/csd-1 keys.
+            //
+            // To handle both cases, we use probeCsdBytes() which:
+            //   1. First tries the MediaFormat csd-0/csd-1 keys (fast path).
+            //   2. Falls back to reading samples and harvesting the bytes of
+            //      any sample flagged with BUFFER_FLAG_CODEC_CONFIG for the
+            //      target track (slow path).
+            // The harvested bytes are passed to toMedia3Format() as an explicit
+            // override for the Format's initializationData, bypassing the
+            // unreliable MediaFormat csd-* keys.
             val muxer = Mp4Muxer.Builder(FileOutputStream(outputMp4))
                 .build()
 
-            val videoFormat = ensureCsdPopulated(vExtractor, videoTrackIndex)
+            val videoCsd = probeCsdBytes(vExtractor, videoTrackIndex)
+            if (videoCsd.isEmpty()) {
+                error(
+                    "Could not extract H.264/HEVC codec-specific data (SPS/PPS) from the video track. " +
+                        "MediaExtractor neither populated csd-0/csd-1 in the MediaFormat nor emitted " +
+                        "any sample with BUFFER_FLAG_CODEC_CONFIG flag. The video .ts may be corrupted " +
+                        "or use an unsupported codec. Try a different quality variant.",
+                )
+            }
+            val videoFormat = vExtractor.getTrackFormat(videoTrackIndex)
             sanitizeMediaFormatDuration(videoFormat)
-            val videoOutTrackId: Int = muxer.addTrack(toMedia3Format(videoFormat))
+            val videoOutTrackId: Int = muxer.addTrack(toMedia3Format(videoFormat, videoCsd))
 
             // External audio tracks (one per separate .ts file).
             val externalAudioTrackIds: List<Int> = audioExtractors.mapIndexed { idx, ext ->
-                val format = ensureCsdPopulated(ext, audioTrackIndices[idx])
+                val audioCsd = probeCsdBytes(ext, audioTrackIndices[idx])
+                val format = ext.getTrackFormat(audioTrackIndices[idx])
                 sanitizeMediaFormatDuration(format)
                 audioTracks.getOrNull(idx)?.language?.takeIf { it.isNotBlank() }?.let { lang ->
                     format.setString(MediaFormat.KEY_LANGUAGE, lang)
                 }
-                muxer.addTrack(toMedia3Format(format))
+                muxer.addTrack(toMedia3Format(format, audioCsd))
             }
 
             // Embedded audio tracks (only those that have at least 1 sample).
             // Also sanitize duration on each.
             val embeddedAudioTrackIds: List<Int> = embeddedAudioTrackIndices.map { idx ->
-                val format = ensureCsdPopulated(vExtractor, idx)
+                val audioCsd = probeCsdBytes(vExtractor, idx)
+                val format = vExtractor.getTrackFormat(idx)
                 sanitizeMediaFormatDuration(format)
-                muxer.addTrack(toMedia3Format(format))
+                muxer.addTrack(toMedia3Format(format, audioCsd))
             }
 
             val buffer = ByteBuffer.allocateDirect(2 * 1024 * 1024)
@@ -1242,83 +1257,83 @@ internal actual object DownloadsPlatformDownloader {
     }
 
     /**
-     * Ensure the `csd-0`/`csd-1` codec-specific data is populated in the
-     * MediaFormat returned by [MediaExtractor.getTrackFormat] for [trackIdx].
+     * Extract codec-specific data (CSD) bytes for [trackIdx] from [extractor].
      *
-     * Background: MediaExtractor on Android does NOT extract CSD (SPS/PPS for
-     * H.264, VPS+SPS+PPS for HEVC, AudioSpecificConfig for AAC, ...) at
-     * `setDataSource()` time. For TS files, the CSD is embedded inside the
-     * first keyframe access unit, and MediaExtractor only parses it when
-     * `readSampleData()` reads that keyframe. As a result, calling
-     * `getTrackFormat()` immediately after `setDataSource()` returns a
-     * MediaFormat WITHOUT csd-0/csd-1, which causes Mp4Muxer.addTrack() to
-     * fail with:
+     * Background: MediaExtractor on Android has TWO ways of exposing CSD
+     * (SPS/PPS for H.264, VPS+SPS+PPS for HEVC, AudioSpecificConfig for
+     * AAC, ...), and the behavior depends on the Android version and the
+     * input format:
      *
-     *     "csd-0 and/or csd-1 not found in the format for avcC box"
+     *   1. **MediaFormat keys** (csd-0, csd-1): populated eagerly by some
+     *      MediaExtractor implementations, especially for MP4 inputs. On
+     *      Android 10 / MIUI 12 reading TS files, these keys are TYPICALLY
+     *      EMPTY — MediaExtractor does not bother extracting SPS/PPS from
+     *      the TS keyframe into the MediaFormat.
+     *   2. **Samples flagged with BUFFER_FLAG_CODEC_CONFIG**: emitted as
+     *      separate "samples" by MediaExtractor when reading the file. The
+     *      sample bytes ARE the raw CSD (Annex B form for H.264: starts with
+     *      00 00 00 01 ...).
      *
-     * This function probes the extractor by reading up to 100 samples (or
-     * until a keyframe on the target track is found), then returns the
-     * MediaFormat which now contains csd-0/csd-1. The extractor's read
-     * position is reset to 0 via `seekTo(0, SEEK_TO_PREVIOUS_SYNC)` so the
-     * subsequent write loop reads from the beginning.
+     * This function tries both:
+     *   1. Fast path: read csd-0/csd-1 from the MediaFormat.
+     *   2. Slow path: seek to start, read samples until we find up to 2
+     *      samples flagged BUFFER_FLAG_CODEC_CONFIG for the target track,
+     *      harvest their bytes as csd-0 / csd-1. Then seek back to start.
      *
-     * For audio tracks, the first sample (which contains the AAC ASC) is
-     * usually enough — there is no "keyframe" concept for audio, so the
-     * function just reads 1 sample.
+     * Returns a List<ByteArray> with 0, 1, or 2 elements (in csd-0, csd-1
+     * order). The caller should pass this list to toMedia3Format() as the
+     * `csdOverride` parameter so the Format gets correct initializationData
+     * regardless of which path succeeded.
      *
-     * If the probe fails (no CSD after 100 samples), the function returns
-     * the Format as-is. The downstream `addTrack` call will fail with a clear
-     * error and the user will see a meaningful diagnostic.
+     * The extractor's read position is always reset to 0 (well, to the
+     * previous sync point before 0) before returning, so the main write
+     * loop can proceed normally.
      */
-    private fun ensureCsdPopulated(extractor: MediaExtractor, trackIdx: Int): MediaFormat {
-        val initial = extractor.getTrackFormat(trackIdx)
-        // Fast path: CSD already present (some MediaExtractor implementations
-        // populate it eagerly, especially for fMP4 inputs).
-        if (initial.containsKey("csd-0") || initial.containsKey("csd-1")) {
-            return initial
+    private fun probeCsdBytes(extractor: MediaExtractor, trackIdx: Int): List<ByteArray> {
+        // === Fast path: MediaFormat csd-0 / csd-1 ===
+        val format = extractor.getTrackFormat(trackIdx)
+        val fromFormat = mutableListOf<ByteArray>()
+        for (key in listOf("csd-0", "csd-1")) {
+            if (!format.containsKey(key)) continue
+            val bb = format.getByteBuffer(key) ?: continue
+            if (bb.remaining() <= 0) continue
+            val bytes = ByteArray(bb.remaining())
+            bb.duplicate().get(bytes)
+            if (bytes.isNotEmpty()) fromFormat.add(bytes)
         }
+        if (fromFormat.isNotEmpty()) return fromFormat
 
-        // Slow path: probe by reading samples until we hit a keyframe on the
-        // target track. Limit to 100 samples to avoid scanning the whole file.
+        // === Slow path: harvest bytes from BUFFER_FLAG_CODEC_CONFIG samples ===
+        // Read up to 200 samples looking for codec-config samples on the target
+        // track. Collect up to 2 of them (csd-0 + csd-1 for H.264, csd-0 only
+        // for HEVC/AAC).
         val probeBuf = ByteBuffer.allocateDirect(2 * 1024 * 1024)
         extractor.seekTo(0, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+        val harvested = mutableListOf<ByteArray>()
         var attempts = 0
-        val maxAttempts = 100
-        while (attempts < maxAttempts) {
+        val maxAttempts = 200
+        while (attempts < maxAttempts && harvested.size < 2) {
             probeBuf.clear()
             val size = extractor.readSampleData(probeBuf, 0)
             if (size < 0) break
             val flags = extractor.sampleFlags
             val currentTrack = extractor.sampleTrackIndex
+            if (currentTrack == trackIdx &&
+                (flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0 &&
+                size > 0
+            ) {
+                val bytes = ByteArray(size)
+                // Duplicate the buffer so we don't disturb the original's
+                // position; then rewind and read exactly 'size' bytes.
+                probeBuf.duplicate().also { it.flip() }.get(bytes, 0, size)
+                harvested.add(bytes)
+            }
             extractor.advance()
             attempts++
-            // For video: stop at first keyframe (CSD should be populated).
-            // For audio: stop at first sample (ASC is in csd-0 for AAC).
-            val isVideo = runCatching {
-                extractor.getTrackFormat(trackIdx)
-                    .getString(MediaFormat.KEY_MIME)?.startsWith("video/") == true
-            }.getOrDefault(false)
-            if (currentTrack == trackIdx) {
-                if (!isVideo || (flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0) {
-                    // Check if CSD is now present
-                    val fmt = extractor.getTrackFormat(trackIdx)
-                    if (fmt.containsKey("csd-0") || fmt.containsKey("csd-1")) {
-                        // CSD found — reset position and return
-                        extractor.seekTo(0, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
-                        return fmt
-                    }
-                    if (!isVideo) {
-                        // Audio with no CSD after first few samples — give up
-                        // probing and let downstream code handle the missing CSD.
-                        if (attempts >= 5) break
-                    }
-                }
-            }
         }
-
-        // Reset to start before returning
+        // Always reset position so the main write loop starts from the beginning.
         extractor.seekTo(0, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
-        return extractor.getTrackFormat(trackIdx)
+        return harvested
     }
 
     /**
@@ -1352,7 +1367,10 @@ internal actual object DownloadsPlatformDownloader {
      * [sanitizeMediaFormatDuration] before this function is called.
      */
     @OptIn(UnstableApi::class)
-    private fun toMedia3Format(mediaFormat: MediaFormat): Format {
+    private fun toMedia3Format(
+        mediaFormat: MediaFormat,
+        csdOverride: List<ByteArray> = emptyList(),
+    ): Format {
         val builder = Format.Builder()
         val mime = mediaFormat.getString(MediaFormat.KEY_MIME) ?: ""
         builder.setSampleMimeType(mime)
@@ -1385,22 +1403,22 @@ internal actual object DownloadsPlatformDownloader {
         }
 
         // === Codec-Specific Data (CSD) ===
-        // MediaExtractor exposes CSD via the "csd-0" and "csd-1" keys as
-        // ByteBuffer. Media3's Format takes them as a List<ByteArray> via
-        // setInitializationData(). The order matters: csd-0 first, then csd-1.
-        //
-        // The ByteBuffer returned by MediaFormat may have a non-zero position
-        // and a limit smaller than its capacity, so we copy exactly
-        // [position, limit) into a fresh ByteArray.
-        val csdBytes = mutableListOf<ByteArray>()
-        for (csdKey in listOf("csd-0", "csd-1")) {
-            if (!mediaFormat.containsKey(csdKey)) continue
-            val bb = mediaFormat.getByteBuffer(csdKey) ?: continue
-            val bytes = ByteArray(bb.remaining())
-            bb.duplicate().get(bytes) // duplicate() so we don't move the original's position
-            if (bytes.isNotEmpty()) {
-                csdBytes.add(bytes)
+        // Prefer the [csdOverride] (collected by probeCsdBytes via
+        // BUFFER_FLAG_CODEC_CONFIG samples — the reliable path for TS inputs
+        // on Android 10 / MIUI 12). Fall back to the MediaFormat's csd-0/csd-1
+        // keys (works on some other platforms and for MP4 inputs).
+        val csdBytes: List<ByteArray> = if (csdOverride.isNotEmpty()) {
+            csdOverride
+        } else {
+            val fromFormat = mutableListOf<ByteArray>()
+            for (csdKey in listOf("csd-0", "csd-1")) {
+                if (!mediaFormat.containsKey(csdKey)) continue
+                val bb = mediaFormat.getByteBuffer(csdKey) ?: continue
+                val bytes = ByteArray(bb.remaining())
+                bb.duplicate().get(bytes)
+                if (bytes.isNotEmpty()) fromFormat.add(bytes)
             }
+            fromFormat
         }
         if (csdBytes.isNotEmpty()) {
             builder.setInitializationData(csdBytes)
