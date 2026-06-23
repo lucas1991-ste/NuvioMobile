@@ -23,6 +23,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import nuvio.composeapp.generated.resources.*
 import org.jetbrains.compose.resources.getString
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.io.OutputStream
@@ -1303,37 +1304,150 @@ internal actual object DownloadsPlatformDownloader {
         }
         if (fromFormat.isNotEmpty()) return fromFormat
 
-        // === Slow path: harvest bytes from BUFFER_FLAG_CODEC_CONFIG samples ===
-        // Read up to 200 samples looking for codec-config samples on the target
-        // track. Collect up to 2 of them (csd-0 + csd-1 for H.264, csd-0 only
-        // for HEVC/AAC).
+        // === Slow path 1: harvest bytes from BUFFER_FLAG_CODEC_CONFIG samples ===
+        // Works on some Android versions where MediaExtractor emits CSD as a
+        // separate codec-config sample (typical for MP4 inputs, sometimes for TS).
         val probeBuf = ByteBuffer.allocateDirect(2 * 1024 * 1024)
         extractor.seekTo(0, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
         val harvested = mutableListOf<ByteArray>()
         var attempts = 0
         val maxAttempts = 200
-        while (attempts < maxAttempts && harvested.size < 2) {
+        var firstKeyFrameBytes: ByteArray? = null
+        val mime = format.getString(MediaFormat.KEY_MIME) ?: ""
+        while (attempts < maxAttempts) {
             probeBuf.clear()
             val size = extractor.readSampleData(probeBuf, 0)
             if (size < 0) break
             val flags = extractor.sampleFlags
             val currentTrack = extractor.sampleTrackIndex
-            if (currentTrack == trackIdx &&
-                (flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0 &&
-                size > 0
-            ) {
-                val bytes = ByteArray(size)
-                // Duplicate the buffer so we don't disturb the original's
-                // position; then rewind and read exactly 'size' bytes.
-                probeBuf.duplicate().also { it.flip() }.get(bytes, 0, size)
-                harvested.add(bytes)
+            if (currentTrack == trackIdx) {
+                if ((flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0 && size > 0 && harvested.size < 2) {
+                    val bytes = ByteArray(size)
+                    probeBuf.duplicate().also { it.flip() }.get(bytes, 0, size)
+                    harvested.add(bytes)
+                }
+                // Also save the first keyframe for Annex B parsing fallback.
+                if (firstKeyFrameBytes == null &&
+                    (flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0 &&
+                    mime.startsWith("video/") &&
+                    size > 0
+                ) {
+                    firstKeyFrameBytes = ByteArray(size)
+                    probeBuf.duplicate().also { it.flip() }.get(firstKeyFrameBytes, 0, size)
+                }
             }
             extractor.advance()
             attempts++
+            // Stop early if we have both CSD samples AND a keyframe (or if we
+            // already have 2 CSD samples we don't need the keyframe).
+            if (harvested.size >= 2) break
+            if (harvested.size >= 1 && firstKeyFrameBytes != null) break
         }
-        // Always reset position so the main write loop starts from the beginning.
         extractor.seekTo(0, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
-        return harvested
+        if (harvested.isNotEmpty()) return harvested
+
+        // === Slow path 2: parse Annex B NAL units from the first keyframe ===
+        // This is the case that matters for Android 10 / MIUI 12 reading TS
+        // files: MediaExtractor NEVER populates csd-0/csd-1 in the MediaFormat
+        // and NEVER emits samples with BUFFER_FLAG_CODEC_CONFIG. The SPS/PPS
+        // are embedded as Annex B NAL units inside the first keyframe access
+        // unit (typically as NAL type 7 = SPS, NAL type 8 = PPS, before the
+        // IDR slice NAL type 5).
+        //
+        // We split the keyframe bytes by Annex B start codes (00 00 00 01 or
+        // 00 00 01), identify SPS and PPS by their NAL type, and return them
+        // as csd-0 / csd-1 (each prefixed with a 4-byte start code, as Mp4Muxer's
+        // internal AnnexBToAvccConverter expects Annex B form).
+        val kf = firstKeyFrameBytes ?: return emptyList()
+        return when {
+            mime.startsWith("video/avc") || mime.startsWith("video/avc1") -> extractAvcCsdFromKeyFrame(kf)
+            mime.startsWith("video/hevc") || mime.startsWith("video/hvc1") || mime.startsWith("video/hev1") -> extractHevcCsdFromKeyFrame(kf)
+            else -> emptyList()
+        }
+    }
+
+    /**
+     * Split a byte array into NAL units by Annex B start codes
+     * (00 00 00 01 or 00 00 01). Returns the NAL unit bytes WITHOUT the
+     * start code prefix.
+     */
+    private fun splitAnnexBNals(data: ByteArray): List<ByteArray> {
+        val nals = mutableListOf<ByteArray>()
+        var i = 0
+        var nalStart = -1
+        while (i < data.size) {
+            val is4Byte = i + 3 < data.size &&
+                data[i] == 0.toByte() && data[i + 1] == 0.toByte() &&
+                data[i + 2] == 0.toByte() && data[i + 3] == 1.toByte()
+            val is3Byte = i + 2 < data.size &&
+                data[i] == 0.toByte() && data[i + 1] == 0.toByte() &&
+                data[i + 2] == 1.toByte()
+            if (is4Byte || is3Byte) {
+                val scLen = if (is4Byte) 4 else 3
+                if (nalStart >= 0) {
+                    nals.add(data.copyOfRange(nalStart, i))
+                }
+                nalStart = i + scLen
+                i += scLen
+            } else {
+                i++
+            }
+        }
+        if (nalStart >= 0 && nalStart < data.size) {
+            nals.add(data.copyOfRange(nalStart, data.size))
+        }
+        return nals
+    }
+
+    /** Prepend the 4-byte Annex B start code (00 00 00 01) to [nal]. */
+    private fun withStartCode(nal: ByteArray): ByteArray {
+        val out = ByteArray(4 + nal.size)
+        out[0] = 0
+        out[1] = 0
+        out[2] = 0
+        out[3] = 1
+        System.arraycopy(nal, 0, out, 4, nal.size)
+        return out
+    }
+
+    /**
+     * Extract H.264 SPS (NAL type 7) and PPS (NAL type 8) from a keyframe's
+     * Annex B byte stream. Returns a list with 0, 1, or 2 elements:
+     *   - csd-0 = SPS with start code prefix
+     *   - csd-1 = PPS with start code prefix
+     *
+     * NAL type is the lower 5 bits of the first byte of the NAL unit
+     * (after the start code).
+     */
+    private fun extractAvcCsdFromKeyFrame(keyFrameBytes: ByteArray): List<ByteArray> {
+        val nals = splitAnnexBNals(keyFrameBytes)
+        val sps = nals.firstOrNull { it.isNotEmpty() && (it[0].toInt() and 0x1F) == 7 }
+        val pps = nals.firstOrNull { it.isNotEmpty() && (it[0].toInt() and 0x1F) == 8 }
+        val csd = mutableListOf<ByteArray>()
+        if (sps != null) csd.add(withStartCode(sps))
+        if (pps != null) csd.add(withStartCode(pps))
+        return csd
+    }
+
+    /**
+     * Extract HEVC VPS (NAL type 32), SPS (NAL type 33), PPS (NAL type 34)
+     * from a keyframe's Annex B byte stream. Per ISO/IEC 14496-15, the hvcC
+     * box expects them concatenated in csd-0 (in VPS, SPS, PPS order), each
+     * with a 4-byte start code prefix.
+     *
+     * HEVC NAL type is bits 1-6 of the first byte: (byte & 0x7E) >> 1.
+     */
+    private fun extractHevcCsdFromKeyFrame(keyFrameBytes: ByteArray): List<ByteArray> {
+        val nals = splitAnnexBNals(keyFrameBytes)
+        val vps = nals.firstOrNull { it.isNotEmpty() && ((it[0].toInt() and 0x7E) ushr 1) == 32 }
+        val sps = nals.firstOrNull { it.isNotEmpty() && ((it[0].toInt() and 0x7E) ushr 1) == 33 }
+        val pps = nals.firstOrNull { it.isNotEmpty() && ((it[0].toInt() and 0x7E) ushr 1) == 34 }
+        if (vps == null && sps == null && pps == null) return emptyList()
+        val out = ByteArrayOutputStream()
+        if (vps != null) out.write(withStartCode(vps))
+        if (sps != null) out.write(withStartCode(sps))
+        if (pps != null) out.write(withStartCode(pps))
+        return listOf(out.toByteArray())
     }
 
     /**
